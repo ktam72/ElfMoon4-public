@@ -37,19 +37,19 @@ class StreamingMoE(nn.Module):
         if self.norm:
             w = w / mx.sum(w, axis=-1, keepdims=True)
         idx_l = idx.tolist()
+        w_l = w.tolist()
         D = shp[-1]
-        outs = []
-        for n in range(xf.shape[0]):
-            # k個のactive expertをcache/storeから取得し、重みをstack
-            experts = [self._cache.get((self.layer_idx, e),
-                                       lambda l=self.layer_idx, e=e: self._store.load(l, e))
-                       for e in idx_l[n]]
+        N = xf.shape[0]
 
-            def st(key):
-                return mx.stack([e[key] for e in experts])   # [k, ...]
+        def load(e):
+            return self._cache.get((self.layer_idx, e),
+                                   lambda e=e: self._store.load(self.layer_idx, e))
 
-            # 1トークンをk方向にブロードキャストして3回のバッチmatmulで一括計算
-            xb = mx.broadcast_to(xf[n].reshape(1, 1, D), (self.top_k, 1, D))
+        if N == 1:
+            # --- デコード: 1トークンのk expertをstackして3回のバッチmatmul ---
+            experts = [load(e) for e in idx_l[0]]
+            st = lambda key: mx.stack([e[key] for e in experts])
+            xb = mx.broadcast_to(xf[0].reshape(1, 1, D), (self.top_k, 1, D))
             g = mx.quantized_matmul(xb, st("gate.wq"), st("gate.s"), st("gate.b"),
                                     transpose=True, group_size=GROUP, bits=BITS)
             u = mx.quantized_matmul(xb, st("up.wq"), st("up.s"), st("up.b"),
@@ -57,9 +57,23 @@ class StreamingMoE(nn.Module):
             h = (g * mx.sigmoid(g)) * u
             yo = mx.quantized_matmul(h, st("down.wq"), st("down.s"), st("down.b"),
                                      transpose=True, group_size=GROUP, bits=BITS)  # [k,1,D]
-            wv = w[n].astype(yo.dtype)                        # [k]
-            outs.append((yo[:, 0, :] * wv[:, None]).sum(0))   # [D]
-        return mx.stack(outs).reshape(shp).astype(x.dtype)
+            wv = w[0].astype(yo.dtype)
+            return (yo[:, 0, :] * wv[:, None]).sum(0).reshape(shp).astype(x.dtype)
+
+        # --- プレフィル(N>1): expertごとにトークンをまとめ、1expert=1回のmatmul ---
+        from collections import defaultdict
+        groups = defaultdict(list)                    # e -> [(token, weight), ...]
+        for t in range(N):
+            for j in range(self.top_k):
+                groups[int(idx_l[t][j])].append((t, w_l[t][j]))
+        out = mx.zeros((N, D))
+        for e, members in groups.items():
+            wt = load(e)
+            ts = mx.array([t for t, _ in members])
+            wv = mx.array([wv for _, wv in members]).reshape(-1, 1)
+            y = expert_ffn(xf[ts], wt) * wv           # [m, D] そのexpertの全トークンを一括
+            out = out.at[ts].add(y)                   # scatter-add
+        return out.reshape(shp).astype(x.dtype)
 
 
 def wire_streaming(model, capacity, top_k=8):
@@ -86,7 +100,13 @@ if __name__ == "__main__":
     cache, store = wire_streaming(model, cap)
     print(f"差し替え完了。常駐メモリ={mx.get_active_memory()/1e9:.2f}GB")
 
-    prompt = "Write a Swift function gcd(_ a: Int, _ b: Int) -> Int. Code only."
+    plen = sys.argv[2] if len(sys.argv) > 2 else "short"
+    if plen == "long":
+        # 長文脈プレフィル（既存コードを文脈として与える, ~300+トークン）
+        ctx = "\n".join(f"func f{i}(_ x: Int) -> Int {{ return x * {i} + {i*i} }}" for i in range(40))
+        prompt = ctx + "\n// 上記を踏まえ、Swiftで最大公約数gcd(_:_:)を書いて。コードのみ。"
+    else:
+        prompt = "Write a Swift function gcd(_ a: Int, _ b: Int) -> Int. Code only."
     t = time.perf_counter()
     out = generate(model, tok, prompt=prompt, max_tokens=80, verbose=True)
     dt = time.perf_counter() - t
