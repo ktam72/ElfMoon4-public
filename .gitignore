@@ -1,0 +1,20 @@
+# 巨大バイナリ（モデル重み・分解済expert）はコミットしない
+models/
+spike/
+elfmoon/spike/
+
+# 参照用に clone した外部リポジトリ（antirez/ds4）
+ref-ds4/
+
+# ログ・一時ファイル
+*.log
+logs/
+build/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
