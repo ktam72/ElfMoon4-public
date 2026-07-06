@@ -93,30 +93,58 @@ python3 integrate.py split_all ../models/qwen3-coder-mlx
 
 ## 使い方
 
-### ElfMoon ストリーミングで生成
+### ① AIコーディングで使う（対話CLI）← 実運用はこれ
 
 ```bash
 cd elfmoon
+python3 chat.py            # 常駐2800(既定, 速度重視)
+python3 chat.py 1200       # 省メモリ
+```
 
-# 常駐expert数を指定（多いほど命中率↑・メモリ↑）
-python3 stream_model.py 2800          # 短いプロンプトで生成
+- モデルのロードは**最初の1回だけ（約6秒）**。以降は対話ループで何度でも依頼できる
+- **日本語でそのまま依頼**してOK。会話履歴を保持するので続きの相談もできる
+- `exit` か `Ctrl-D` で終了
+
+**対話の様子:**
+```
+モデルをロード中...（常駐 2800 experts ≈ 7.4GB）
+準備完了（6秒）。コーディングの依頼をどうぞ。
+
+あなた> Swiftで文字列配列から重複を除去する関数を書いて
+ElfMoon> ```swift
+func removeDuplicates<T: Hashable>(from array: [T]) -> [T] {
+    var seen = Set<T>()
+    return array.filter { seen.insert($0).inserted }
+}
+```
+（45 tokens, 13.0 tok/s, 命中率85%）
+
+あなた> その関数に、空配列のときは早期returnする処理を足して
+ElfMoon> （履歴を踏まえて修正版を返す）
+```
+
+**実際のワークフロー例（既存コードを読ませて直す）:**
+```
+あなた> 以下のSwiftコードのバグを直して:
+（ここに自分のコードを貼り付けて Enter）
+```
+> 💡 長いコードを貼り付けても、**expert-grouped プレフィルが速い（〜148 t/s）**ので待たされない。
+> 最初の1回の応答はキャッシュが温まるまで少し遅く、2回目以降は速くなる。
+
+**Xcode と同時に使う**（実機テストしながらAIコーディング）:
+そのまま別ターミナルで `chat.py` を起動すればよい。常駐0.87GB＋キャッシュ分だけなので、
+Xcode（シミュレータ不使用・実機デバッグ）と共存しても生成速度は維持される（実測済み）。
+
+### ② 動作デモ・ベンチ（1発生成）
+
+```bash
+python3 stream_model.py 2800          # 短いプロンプトで1回生成＋速度表示
 python3 stream_model.py 2800 long     # 長文脈プレフィルのデモ（958トークン）
-```
-
-出力例:
-```
-差し替え完了。常駐メモリ=0.87GB
-func gcd(_ a: Int, _ b: Int) -> Int { ... }   ← 生成コード
-Prompt: 958 tokens, 148 tokens-per-sec
-Generation: 60 tokens, 13.3 tokens-per-sec
-命中率=73.5% (hit=... miss=... 常駐=2800)
 ```
 
 **常駐容量の目安**（expert 1個 ≈ 2.65MB）:
 - `2800` ≈ 7.4GB（命中率〜85%、速度重視）
 - `1200` ≈ 3.2GB（命中率〜67%、省メモリ）
-
-生成するプロンプトを変えたい場合は `stream_model.py` 末尾の `prompt = ...` を編集。
 
 ### 参照: フルモデル（mlx_lm 標準, 全expert常駐 16GB）
 
@@ -148,6 +176,7 @@ python3 -c "from mlx_lm import load, generate; m,t=load('models/qwen3-coder-mlx'
 - ✅ 実Xcode共存で実用速度を実証
 - ⬜ ④ 非同期プリフェッチ（実12GB機到着後に実装）
 - ⬜ より大きいモデルへスケール（Qwen3-Next-80B / 128GB機で DeepSeek V4級）
+- ⬜ **OpenAI互換APIサーバ**（VS Code / Zed / Cursor など既存のAIコーディング拡張から使えるように）。現状は `chat.py` の対話CLIのみ。
 
 詳細な設計と全実測は **[PHASE1_DESIGN.md](PHASE1_DESIGN.md)** を参照。
 
