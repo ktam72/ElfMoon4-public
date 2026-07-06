@@ -4,7 +4,7 @@
 import time
 import mlx.core as mx
 import mlx.nn as nn
-from expert_store import ExpertStore, expert_ffn
+from expert_store import ExpertStore, expert_ffn, GROUP, BITS
 from resident_cache import ResidentCache
 
 import os
@@ -37,17 +37,28 @@ class StreamingMoE(nn.Module):
         if self.norm:
             w = w / mx.sum(w, axis=-1, keepdims=True)
         idx_l = idx.tolist()
-        w_l = w.tolist()
+        D = shp[-1]
         outs = []
         for n in range(xf.shape[0]):
-            acc = mx.zeros((shp[-1],))
-            xn = xf[n][None]
-            for j in range(self.top_k):
-                e = int(idx_l[n][j])
-                wt = self._cache.get((self.layer_idx, e),
-                                     lambda l=self.layer_idx, e=e: self._store.load(l, e))
-                acc = acc + w_l[n][j] * expert_ffn(xn, wt)[0]
-            outs.append(acc)
+            # k個のactive expertをcache/storeから取得し、重みをstack
+            experts = [self._cache.get((self.layer_idx, e),
+                                       lambda l=self.layer_idx, e=e: self._store.load(l, e))
+                       for e in idx_l[n]]
+
+            def st(key):
+                return mx.stack([e[key] for e in experts])   # [k, ...]
+
+            # 1トークンをk方向にブロードキャストして3回のバッチmatmulで一括計算
+            xb = mx.broadcast_to(xf[n].reshape(1, 1, D), (self.top_k, 1, D))
+            g = mx.quantized_matmul(xb, st("gate.wq"), st("gate.s"), st("gate.b"),
+                                    transpose=True, group_size=GROUP, bits=BITS)
+            u = mx.quantized_matmul(xb, st("up.wq"), st("up.s"), st("up.b"),
+                                    transpose=True, group_size=GROUP, bits=BITS)
+            h = (g * mx.sigmoid(g)) * u
+            yo = mx.quantized_matmul(h, st("down.wq"), st("down.s"), st("down.b"),
+                                     transpose=True, group_size=GROUP, bits=BITS)  # [k,1,D]
+            wv = w[n].astype(yo.dtype)                        # [k]
+            outs.append((yo[:, 0, :] * wv[:, None]).sum(0))   # [D]
         return mx.stack(outs).reshape(shp).astype(x.dtype)
 
 
@@ -77,7 +88,7 @@ if __name__ == "__main__":
 
     prompt = "Write a Swift function gcd(_ a: Int, _ b: Int) -> Int. Code only."
     t = time.perf_counter()
-    out = generate(model, tok, prompt=prompt, max_tokens=80, verbose=False)
+    out = generate(model, tok, prompt=prompt, max_tokens=80, verbose=True)
     dt = time.perf_counter() - t
     print("=== 生成 ===")
     print(out)
