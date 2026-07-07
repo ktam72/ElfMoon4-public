@@ -23,15 +23,9 @@ MAX_HISTORY = 8
 TEMP = 0.4
 
 
-_think_done = False
-
-
 def _strip_think(text_iter, no_think):
     """Strip <think> block from stream if no_think is set."""
-    global _think_done
-    _think_done = False
     if not no_think:
-        _think_done = True
         yield from text_iter
         return
     skip = True
@@ -43,7 +37,6 @@ def _strip_think(text_iter, no_think):
             idx = buf.find("</think>")
             if idx >= 0:
                 skip = False
-                _think_done = True
                 if dots:
                     print("\b" * dots + " " * dots + "\b" * dots, end="", flush=True)
                     dots = 0
@@ -57,6 +50,11 @@ def _strip_think(text_iter, no_think):
                     print(".", end="", flush=True)
         else:
             yield piece
+    # </think> が最後まで現れなかった場合、溜めた分を破棄せず出力する
+    if skip and buf:
+        if dots:
+            print("\b" * dots + " " * dots + "\b" * dots, end="", flush=True)
+        yield buf
 
 
 def main():
@@ -118,8 +116,9 @@ def main():
                 print(piece, end="", flush=True)
                 resp += piece
                 n += 1
-        except Exception:
-            pass
+        except Exception as e:
+            # 生成失敗を黙殺しない（途中で切れた応答を正常完了に見せない）
+            print(f"\n\033[1;31m[エラー] 生成が中断されました: {e}\033[0m")
 
         elapsed = (
             (time.perf_counter() - answer_t) if answer_t else (time.perf_counter() - t)

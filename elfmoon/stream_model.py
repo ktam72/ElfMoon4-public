@@ -1,16 +1,12 @@
-"""最終統合: mlx_lm の Qwen3-Coder の各層MoEを ElfMoon ストリーミングMoEに差し替える。
-融合 switch_mlp(16GB) を解放し、ExpertStore + ResidentCache から必要分だけ流す。
+"""最終統合: mlx_lm の Qwen MoE 系モデルの各層MoEを ElfMoon ストリーミングMoEに差し替える。
+融合 switch_mlp（Qwen3.6-35B で約17GB）を解放し、ExpertStore + ResidentCache から必要分だけ流す。
 """
 
 import os
-import sys
 import time
-from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache
-from mlx_lm.models.base import create_causal_mask
 
 from expert_store import ExpertStore, GROUP, BITS
 from resident_cache import ResidentCache
@@ -51,132 +47,6 @@ def _decode_moe(
         h, w_dw, s_dw, b_dw, transpose=True, group_size=GROUP, bits=BITS
     )
     return (yo[:, 0, :] * weights[:, None]).sum(0)
-
-
-# ---- B: Fixed-size KV cache for compile-friendly attention ----
-
-
-class FixedKVCache:
-    """KV cache with pre-allocated fixed-size arrays for mx.compile compatibility.
-
-    Unlike KVCache, update_and_fetch always returns arrays of shape
-    (B, n_kv_heads, max_size, head_dim). A mask from make_mask() blocks
-    unwritten positions so mx.fast.scaled_dot_product_attention works correctly.
-    """
-
-    def __init__(self, max_size: int = 4096, step: int = 256):
-        self.keys: Optional[mx.array] = None
-        self.values: Optional[mx.array] = None
-        self.offset: int = 0
-        self.max_size = max_size
-        self.step = step
-        self._n_kv_heads = 0
-        self._head_dim = 0
-        self._v_head_dim = 0
-
-    def update_and_fetch(
-        self, keys: mx.array, values: mx.array
-    ) -> Tuple[mx.array, mx.array]:
-        prev = self.offset
-        cur_len = self.keys.shape[-2] if self.keys is not None else 0
-        need_full = cur_len < self.max_size
-
-        if need_full:
-            B, n_kv_heads = keys.shape[0], keys.shape[1]
-            if self.keys is not None and cur_len > 0:
-                k_head_dim = self.keys.shape[-1]
-                v_head_dim = self.values.shape[-1]
-                shape = (B, n_kv_heads, self.max_size, k_head_dim)
-                new_k = mx.zeros(shape, self.keys.dtype)
-                new_v = mx.zeros(shape, self.values.dtype)
-                new_k[..., :cur_len, :] = self.keys
-                new_v[..., :cur_len, :] = self.values
-                self.keys = new_k
-                self.values = new_v
-            else:
-                k_head_dim = keys.shape[-1]
-                v_head_dim = values.shape[-1]
-                shape = (B, n_kv_heads, self.max_size, k_head_dim)
-                self.keys = mx.zeros(shape, keys.dtype)
-                self.values = mx.zeros(shape, values.dtype)
-
-        S = keys.shape[-2]
-        end = prev + S
-        self.keys[..., prev:end, :] = keys
-        self.values[..., prev:end, :] = values
-        self.offset = end
-        return self.keys, self.values
-
-    def make_mask(
-        self,
-        N: int,
-        return_array: bool = False,
-        window_size: Optional[int] = None,
-    ) -> Optional[mx.array]:
-        finfo_min = mx.array(mx.finfo(mx.bfloat16).min, dtype=mx.bfloat16)
-        zero = mx.array(0, dtype=mx.bfloat16)
-        if N == 1:
-            visible = mx.arange(self.max_size) < (self.offset + N)
-            return mx.where(visible[None, None, None, :], zero, finfo_min)
-        else:
-            off = self.offset
-            q_pos = mx.arange(off, off + N, dtype=mx.int64)[:, None]
-            k_pos = mx.arange(self.max_size, dtype=mx.int64)[None, :]
-            valid = mx.arange(self.max_size) < (off + N)
-            causal = k_pos <= q_pos
-            mask = mx.where(valid[None, :] & causal, zero, finfo_min)
-            return mask[None, None, :, :]
-
-    @property
-    def state(self) -> Tuple[Optional[mx.array], Optional[mx.array]]:
-        return self.keys, self.values
-
-    @state.setter
-    def state(self, v: Tuple[Optional[mx.array], Optional[mx.array]]):
-        self.keys, self.values = v
-        if self.keys is not None:
-            self.offset = self.keys.shape[-2]
-
-    def is_trimmable(self) -> bool:
-        return True
-
-    def trim(self, n: int) -> int:
-        n = min(self.offset, n)
-        self.offset -= n
-        return n
-
-    def size(self) -> int:
-        return self.offset
-
-    def empty(self) -> bool:
-        return self.keys is None
-
-    @property
-    def nbytes(self) -> int:
-        if self.keys is None:
-            return 0
-        return self.keys.nbytes + self.values.nbytes
-
-
-def _has_gqa_rope(attn) -> bool:
-    """Check if attention module uses GQA-style RoPE (offset kwarg)."""
-    import inspect
-
-    src = inspect.getsource(attn.__call__)
-    return "cache.offset" in src or "offset=cache" in src
-
-
-def wire_fixed_cache(model, max_kv_size: int = 4096):
-    """Replace KVCache objects with FixedKVCache so all cache arrays have static shape.
-
-    Must be called AFTER wire_streaming (model.mlp replaced).
-    The model's attention forward uses cache[index].make_mask() which
-    FixedKVCache overrides to return custom masks for padded positions.
-    """
-    layers = model.model.layers
-    n_layers = len(layers)
-    caches = [FixedKVCache(max_size=max_kv_size) for _ in range(n_layers)]
-    return caches
 
 
 # ---- Streaming MoE（MoE 層差し替え） ----
@@ -350,7 +220,7 @@ if __name__ == "__main__":
     from mlx_lm import load, generate
 
     cap = int(sys.argv[1]) if len(sys.argv) > 1 else 1200
-    print(f"常駐容量={cap} experts (~{cap * 2.65 / 1000:.1f}GB)")
+    print(f"常駐容量={cap} experts (~{cap * 1.69 / 1000:.1f}GB)")
     model, tok = load(MODEL_PATH)
     print("元モデル ロード完了。ストリーミング化中...")
     cache, store = wire_streaming(model, cap)

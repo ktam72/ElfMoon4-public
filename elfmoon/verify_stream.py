@@ -1,26 +1,38 @@
 """ストリーミングMoEが元のmlpと一致するか、実モデルで層単位検証する。
-ずれていれば我々の実装バグ。一致すれば言語問題は別要因。
+ずれていれば我々の実装バグ。一致すれば出力品質の問題は別要因。
+
+先に integrate.py split_all で spike/real_store, spike/real_gates を生成しておくこと。
 """
 import mlx.core as mx
 from mlx_lm import load
-from stream_model import StreamingMoE, MODEL_PATH
+from stream_model import StreamingMoE, MODEL_PATH, STORE_DIR
 from expert_store import ExpertStore
 from resident_cache import ResidentCache
 
 model, tok = load(MODEL_PATH)
-layers = model.model.layers
-store = ExpertStore("spike/real_store")
+layers = getattr(model, "layers", None) or model.model.layers
+store = ExpertStore(STORE_DIR)
 cache = ResidentCache(200000)   # 全部載る大容量（キャッシュ影響を排除）
 
-D = model.model.layers[0].mlp.gate.weight.shape[1] if hasattr(
-    model.model.layers[0].mlp.gate, "weight") else 2048
+# 隠れ次元をルーターgateから逆算（QuantizedLinear: 32/bits 値が uint32 に詰まる）
+g0 = layers[0].mlp.gate
+D = g0.weight.shape[1] * (32 // g0.bits) if hasattr(g0, "bits") else g0.weight.shape[1]
+n_layers = len(layers)
+print(f"layers={n_layers}, hidden={D}")
 
-for l in (0, 1, 24, 47):
+for l in sorted({0, 1, n_layers // 2, n_layers - 1}):
     orig = layers[l].mlp                       # 元の融合MoE
-    mine = StreamingMoE(l, orig.gate,
-                        orig.switch_mlp.gate_proj.weight.shape[0],
-                        8, store, cache)
-    x = mx.random.normal((1, 3, 2048)).astype(mx.float16)   # [B,T,D]
+    mine = StreamingMoE(
+        l,
+        orig.gate,
+        orig.switch_mlp.gate_proj.weight.shape[0],
+        8,
+        store,
+        cache,
+        shared_exp=getattr(orig, "shared_expert", None),
+        shared_gate=getattr(orig, "shared_expert_gate", None),
+    )
+    x = mx.random.normal((1, 3, D)).astype(mx.float16)   # [B,T,D]
     yo = orig(x)
     ym = mine(x)
     err = float(mx.max(mx.abs(yo.astype(mx.float32) - ym.astype(mx.float32))))

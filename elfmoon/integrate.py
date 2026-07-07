@@ -1,9 +1,9 @@
-"""実重み統合（mlx_lm非依存）: MLX版Qwen3-Coder の safetensors を直接読み、
+"""実重み統合（mlx_lm非依存）: MLX版 Qwen MoE 系の safetensors を直接読み、
 融合 switch_mlp を per-expert に分解して ExpertStore 形式で保存する。
 
-キー構造（確認済）:
-  model.layers.{l}.mlp.gate.{weight,scales,biases}                 ルーター(8bit)
-  model.layers.{l}.mlp.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}  融合expert(4bit,[128,...])
+キー構造（prefix は _detect_prefix で自動検出。例: 'model', 'language_model.model'）:
+  {prefix}.layers.{l}.mlp.gate.{weight,scales,biases}                 ルーター(8bit)
+  {prefix}.layers.{l}.mlp.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}  融合expert(4bit,[n_experts,...])
 量子化パラメータ: expert=group64/bit4（ExpertStoreと一致→スライスのみ）, gate=group64/bit8。
 """
 
@@ -36,11 +36,6 @@ def load_shards(path):
     for shard in sorted(set(idx["weight_map"].values())):
         W.update(mx.load(os.path.join(path, shard)))  # mmap
     return W
-
-
-def _base(l):
-    p = PREFIX[0]
-    return f"{p + '.' if p else ''}layers.{l}.mlp"
 
 
 def router_gate_float(W, l):
@@ -92,10 +87,10 @@ def verify_layer0(path):
 
     W = load_shards(path)
     store_dir, gate_dir = "spike/real_store", "spike/real_gates"
-    pfx = _detect_prefix(W)
+    PREFIX[0] = _detect_prefix(W)  # split_layer が参照する prefix を設定
     n = split_layer(W, 0, store_dir, gate_dir)
     store = ExpertStore(store_dir)
-    base = f"{pfx}.layers.0.mlp.switch_mlp"
+    base = f"{_base(0)}.switch_mlp"
     x = mx.random.normal((1, 2048))
     max_err = 0.0
     for e in (0, 7, 63, 127):
@@ -117,7 +112,7 @@ def verify_layer0(path):
 
 
 if __name__ == "__main__":
-    path = sys.argv[2] if len(sys.argv) > 2 else "../models/qwen3-30b-instruct-mlx"
+    path = sys.argv[2] if len(sys.argv) > 2 else "../models/qwen3.6-35b-mlx"
     cmd = sys.argv[1] if len(sys.argv) > 1 else "verify"
     if cmd == "verify":
         verify_layer0(path)

@@ -1,8 +1,25 @@
+"""KV Cache 永続化マネージャ（ハイブリッドアーキテクチャ対応）。
+
+Qwen3.6 系は full attention（KVCache）と linear attention（ArraysCache＝再帰状態）が
+混在する。再帰状態は KV と違って途中位置に切り詰められないため、保存は
+「全レイヤーが同一トークン数を処理した整合状態」でのみ行う。
+
+運用フロー（api_server 側）:
+  1. prefill 完了直後（プロンプト先頭 len-1 トークン処理時点）に snapshot() で
+     状態への参照を捕捉する（この時点では重いコピーをしない）
+  2. 生成完了後に save() で捕捉時点の状態をメモリ＋ディスクへ永続化する
+  3. 次リクエストの lookup() はプロンプトとの最長プレフィックス一致を返す
+
+ディスク形式は version=2（KV に加えて再帰状態も保存）。旧形式（v1）は
+再帰状態を欠く不整合データのため、起動時に削除する。
+"""
+
 import hashlib
 import json
 import os
 import struct
 import sys
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,41 +27,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 from mlx_lm.models.cache import KVCache, ArraysCache
 
-SAVE_RATIO = 0.95
 DISK_CACHE_DIR = os.path.expanduser("~/.cache/elfmoon/kv_cache")
 MAX_DISK_ENTRIES = 4
-
-
-def _truncate_cache(cache: List[Any], new_offset: int) -> List[Tuple[str, Any]]:
-    """Truncate cache and return per-layer (type_tag, data).
-
-    - KVCache: tag='kv', data=(keys, vals) truncated to new_offset
-    - ArraysCache: tag='arr', data=state (list of arrays, or None if empty)
-    """
-    truncated = []
-    for c in cache:
-        if isinstance(c, KVCache):
-            if c.keys is not None and new_offset > 0:
-                k = c.keys[..., :new_offset, :].astype(mx.float16)
-                v = c.values[..., :new_offset, :].astype(mx.float16)
-                mx.eval([k, v])
-            else:
-                k = mx.zeros((1, 1, 0, 1), dtype=mx.float16)
-                v = mx.zeros((1, 1, 0, 1), dtype=mx.float16)
-            truncated.append(("kv", (k, v)))
-        elif isinstance(c, ArraysCache) and not c.empty():
-            mx.eval([x for x in c.state if x is not None])
-            truncated.append(("arr", c.state))
-        else:
-            truncated.append(("arr", None))
-    return truncated
+MIN_SAVE_TOKENS = 20
+FORMAT_VERSION = 2
 
 
 def _build_cache_objects(
     offset: int, layer_data: List[Tuple[str, Any]], n_layers: int
 ) -> List[Any]:
-    """Reconstruct cache from saved data. SSM layers restore state if saved."""
-    cache = []
+    """保存データからキャッシュオブジェクトを再構築する。"""
+    cache: List[Any] = []
     for tag, data in layer_data:
         if tag == "kv":
             keys, vals = data
@@ -64,17 +57,15 @@ def _build_cache_objects(
 
 
 class KVCacheManager:
-    """KV Cache store with hash-based lookup.
+    """整合スナップショット方式の KV Cache ストア（メモリ＋ディスク）。"""
 
-    Saves only the first SAVE_RATIO portion of the cache (system prompt part),
-    so subsequent requests with different user messages still hit the cache.
-    Also persists to disk so cache survives server restarts.
-    """
-
-    def __init__(self, max_entries: int = 4):
+    def __init__(self, max_entries: int = 4, cache_dir: str = DISK_CACHE_DIR):
         self._caches: OrderedDict = OrderedDict()
         self._max_entries = max_entries
-        os.makedirs(DISK_CACHE_DIR, exist_ok=True)
+        self._dir = cache_dir
+        self._disk_lock = threading.Lock()
+        os.makedirs(self._dir, exist_ok=True)
+        self._purge_old_format()
 
     # ---- hash ----
 
@@ -82,23 +73,71 @@ class KVCacheManager:
         packed = b"".join(struct.pack("<i", t) for t in tokens[:length])
         return hashlib.sha256(packed).hexdigest()
 
-    # ---- lookup (memory then disk) ----
+    # ---- snapshot ----
+
+    def snapshot(self, cache: List[Any]) -> Optional[List[Tuple[str, Any]]]:
+        """prefill 直後のキャッシュ状態を捕捉する（save() で永続化する）。
+
+        MLX 配列への添字代入は新しいバッキングを生成するため、ArraysCache の
+        state は mx.array() でコピーすれば以後の生成に影響されない。
+        KVCache のバッファは offset 以降にのみ追記されるので、参照を保持して
+        save() 時に offset までスライスすれば捕捉時点の内容が得られる。
+        非対応のキャッシュ型や未初期化の再帰状態がある場合は None（保存不可）。
+        """
+        snap: List[Tuple[str, Any]] = []
+        for c in cache:
+            if isinstance(c, KVCache):
+                snap.append(("kv", (c.keys, c.values, c.offset)))
+            elif isinstance(c, ArraysCache):
+                state = c.state
+                if state is None or any(x is None for x in state):
+                    return None
+                # 上のガードで全要素 non-None を保証済み（if は型絞り込み用）
+                snap.append(("arr", [mx.array(x) for x in state if x is not None]))
+            else:
+                return None
+        return snap
+
+    # ---- lookup（メモリ→ディスク、最長プレフィックス一致） ----
 
     def lookup(self, prompt_ids: List[int], model) -> Tuple[Optional[List[Any]], int]:
         n_layers = len(getattr(model, "layers", None) or model.model.layers)
-        # 1) Memory cache
-        for key, (offset, layer_data) in reversed(list(self._caches.items())):
+
+        # 1) メモリ: 一致する中で最長 offset のエントリ
+        best_key = None
+        best: Optional[Tuple[int, Any]] = None
+        for key, (offset, layer_data) in self._caches.items():
             if (
-                len(prompt_ids) >= offset
+                offset <= len(prompt_ids)
+                and (best is None or offset > best[0])
                 and self._hash_prefix(prompt_ids, offset) == key
             ):
-                self._caches.move_to_end(key)
-                return _build_cache_objects(offset, layer_data, n_layers), offset
+                best_key, best = key, (offset, layer_data)
+        if best is not None:
+            self._caches.move_to_end(best_key)
+            return _build_cache_objects(best[0], best[1], n_layers), best[0]
 
-        # 2) Disk cache
-        for key, offset, layer_data in self._disk_search(prompt_ids):
-            mem_entry = (offset, layer_data)
-            self._caches[key] = mem_entry
+        # 2) ディスク: offset 降順に一致を試す
+        candidates = [
+            e
+            for e in self._list_disk_entries()
+            if e.get("offset", 0) <= len(prompt_ids)
+            and self._hash_prefix(prompt_ids, e["offset"]) == e.get("hash", "")
+        ]
+        candidates.sort(key=lambda e: e["offset"], reverse=True)
+        for entry in candidates:
+            key, offset = entry["hash"], entry["offset"]
+            try:
+                layer_data = self._disk_load_arrays(key)
+            except Exception as e:
+                print(
+                    f"[KVC] disk load error, removing corrupt entry: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._disk_delete(key)
+                continue
+            self._caches[key] = (offset, layer_data)
             self._caches.move_to_end(key)
             while len(self._caches) > self._max_entries:
                 self._caches.popitem(last=False)
@@ -111,34 +150,60 @@ class KVCacheManager:
 
         return None, 0
 
-    # ---- save (memory + disk) ----
+    # ---- save（メモリ＋ディスク） ----
 
-    def save(self, prompt_ids: List[int], cache: List[Any]):
-        if cache is None or len(cache) == 0:
+    def save(self, token_ids: List[int], snap: Optional[List[Tuple[str, Any]]]):
+        """snapshot() の捕捉状態を token_ids（処理済み全トークン）キーで保存する。"""
+        if snap is None:
             return
-        base_length = len(prompt_ids)
-        if base_length < 20:
+        offset = len(token_ids)
+        if offset < MIN_SAVE_TOKENS:
             return
-        save_offset = max(20, int(base_length * SAVE_RATIO))
-        key = self._hash_prefix(prompt_ids, save_offset)
-        truncated = _truncate_cache(cache, save_offset)
+        key = self._hash_prefix(token_ids, offset)
+        if key in self._caches and self._caches[key][0] == offset:
+            # 同一内容が既にある → メモリ/ディスクとも書き直し不要
+            self._caches.move_to_end(key)
+            return
 
-        # Memory
-        self._caches[key] = (save_offset, truncated)
+        layer_data: List[Tuple[str, Any]] = []
+        to_eval: List[mx.array] = []
+        for tag, data in snap:
+            if tag == "kv":
+                keys, vals, kv_off = data
+                end = min(kv_off, offset)
+                if keys is not None and end > 0:
+                    k = keys[..., :end, :].astype(mx.float16)
+                    v = vals[..., :end, :].astype(mx.float16)
+                else:
+                    k = mx.zeros((1, 1, 0, 1), dtype=mx.float16)
+                    v = mx.zeros((1, 1, 0, 1), dtype=mx.float16)
+                layer_data.append(("kv", (k, v)))
+                to_eval.extend([k, v])
+            else:
+                layer_data.append(("arr", data))
+                to_eval.extend(data)
+        mx.eval(to_eval)
+
+        # メモリ
+        self._caches[key] = (offset, layer_data)
         self._caches.move_to_end(key)
         while len(self._caches) > self._max_entries:
             self._caches.popitem(last=False)
 
-        # Disk (fire-and-forget — slow I/O, don't block response)
-        self._disk_save(key, save_offset, truncated, base_length)
+        # ディスク（バックグラウンド書込み: 応答終端をブロックしない）
+        threading.Thread(
+            target=self._disk_save,
+            args=(key, offset, layer_data, len(token_ids)),
+            daemon=True,
+        ).start()
 
     # ---- disk persistence ----
 
     def _disk_path(self, key: str) -> str:
-        return os.path.join(DISK_CACHE_DIR, f"{key}.safetensors")
+        return os.path.join(self._dir, f"{key}.safetensors")
 
     def _meta_path(self, key: str) -> str:
-        return os.path.join(DISK_CACHE_DIR, f"{key}.json")
+        return os.path.join(self._dir, f"{key}.json")
 
     def _disk_save(
         self,
@@ -148,33 +213,42 @@ class KVCacheManager:
         prompt_length: int,
     ):
         try:
-            arrays: Dict[str, mx.array] = {}
-            kv_indices = []
-            for i, (tag, data) in enumerate(layer_data):
-                if tag == "kv":
-                    k, v = data
-                    arrays[f"l{i}_keys"] = k
-                    arrays[f"l{i}_values"] = v
-                    kv_indices.append(i)
+            with self._disk_lock:
+                arrays: Dict[str, mx.array] = {}
+                kv_indices: List[int] = []
+                arr_indices: Dict[str, int] = {}
+                for i, (tag, data) in enumerate(layer_data):
+                    if tag == "kv":
+                        k, v = data
+                        arrays[f"l{i}_keys"] = k
+                        arrays[f"l{i}_values"] = v
+                        kv_indices.append(i)
+                    elif data is not None:
+                        for j, x in enumerate(data):
+                            arrays[f"l{i}_arr{j}"] = x
+                        arr_indices[str(i)] = len(data)
 
-            if arrays:
-                mx.save_safetensors(self._disk_path(key), arrays)
+                if arrays:
+                    mx.save_safetensors(self._disk_path(key), arrays)
 
-            meta = {
-                "hash": key,
-                "offset": offset,
-                "num_layers": len(layer_data),
-                "kv_indices": kv_indices,
-                "prompt_tokens": prompt_length,
-                "created_at": time.time(),
-            }
-            with open(self._meta_path(key), "w") as f:
-                json.dump(meta, f)
+                meta = {
+                    "version": FORMAT_VERSION,
+                    "hash": key,
+                    "offset": offset,
+                    "num_layers": len(layer_data),
+                    "kv_indices": kv_indices,
+                    "arr_indices": arr_indices,
+                    "prompt_tokens": prompt_length,
+                    "created_at": time.time(),
+                }
+                with open(self._meta_path(key), "w") as f:
+                    json.dump(meta, f)
 
-            self._cleanup_disk()
+                self._cleanup_disk()
 
             print(
-                f"[KVC] disk save: key={key[:12]} offset={offset} kv_layers={len(kv_indices)}/{len(layer_data)}",
+                f"[KVC] disk save: key={key[:12]} offset={offset} "
+                f"kv={len(kv_indices)} arr={len(arr_indices)}/{len(layer_data)}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -182,62 +256,66 @@ class KVCacheManager:
             print(f"[KVC] disk save error: {e}", file=sys.stderr, flush=True)
 
     def _disk_load_arrays(self, key: str) -> List[Tuple[str, Any]]:
-        meta_path = self._meta_path(key)
-        with open(meta_path) as f:
+        with open(self._meta_path(key)) as f:
             meta = json.load(f)
-        num_layers = meta.get("num_layers", 48)
+        if meta.get("version") != FORMAT_VERSION:
+            raise ValueError(f"unsupported cache format: {meta.get('version')}")
+        num_layers = meta["num_layers"]
         kv_indices = set(meta.get("kv_indices", []))
-
-        if not kv_indices:
-            raise ValueError(f"No KVCache indices in {self._disk_path(key)}")
+        arr_indices = {int(k): v for k, v in meta.get("arr_indices", {}).items()}
 
         arrays: Dict[str, mx.array] = mx.load(self._disk_path(key))  # type: ignore[assignment]
         layer_data: List[Tuple[str, Any]] = []
         for i in range(num_layers):
             if i in kv_indices:
-                k = arrays.get(f"l{i}_keys")
-                v = arrays.get(f"l{i}_values")
-                if k is not None and v is not None:
-                    layer_data.append(("kv", (k, v)))
-                    continue
-            layer_data.append(("arr", None))
-        if all(tag == "arr" for tag, _ in layer_data):
-            raise ValueError(f"No KVCache entries found in {self._disk_path(key)}")
+                layer_data.append(("kv", (arrays[f"l{i}_keys"], arrays[f"l{i}_values"])))
+            elif i in arr_indices:
+                layer_data.append(
+                    ("arr", [arrays[f"l{i}_arr{j}"] for j in range(arr_indices[i])])
+                )
+            else:
+                layer_data.append(("arr", None))
+        if all(tag == "arr" and d is None for tag, d in layer_data):
+            raise ValueError(f"No cache entries found in {self._disk_path(key)}")
         return layer_data
 
-    def _disk_search(self, prompt_ids: List[int]):
-        """Yield (key, offset, layer_data) for disk entries matching prompt_ids."""
-        entries = self._list_disk_entries()
-        for entry in entries:
-            key = entry.get("hash", "")
-            offset = entry.get("offset", 0)
-            if (
-                len(prompt_ids) >= offset
-                and self._hash_prefix(prompt_ids, offset) == key
-            ):
-                try:
-                    layer_data = self._disk_load_arrays(key)
-                    yield key, offset, layer_data
-                except Exception as e:
-                    print(
-                        f"[KVC] disk load error, removing corrupt entry: {e}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    self._disk_delete(key)
-
     def _list_disk_entries(self) -> List[Dict]:
-        if not os.path.isdir(DISK_CACHE_DIR):
+        if not os.path.isdir(self._dir):
             return []
         entries = []
-        for fname in os.listdir(DISK_CACHE_DIR):
+        for fname in os.listdir(self._dir):
             if fname.endswith(".json"):
                 try:
-                    with open(os.path.join(DISK_CACHE_DIR, fname)) as f:
-                        entries.append(json.load(f))
+                    with open(os.path.join(self._dir, fname)) as f:
+                        meta = json.load(f)
+                    if meta.get("version") == FORMAT_VERSION:
+                        entries.append(meta)
                 except (json.JSONDecodeError, IOError):
                     pass
         return entries
+
+    def _purge_old_format(self):
+        """旧形式（再帰状態を欠く v1）のエントリを削除する。"""
+        if not os.path.isdir(self._dir):
+            return
+        for fname in os.listdir(self._dir):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(self._dir, fname)
+            try:
+                with open(path) as f:
+                    meta = json.load(f)
+                version = meta.get("version")
+            except (json.JSONDecodeError, IOError):
+                version = None
+            if version != FORMAT_VERSION:
+                key = fname[: -len(".json")]
+                self._disk_delete(key)
+                print(
+                    f"[KVC] purged old-format entry: {key[:12]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def _cleanup_disk(self):
         entries = self._list_disk_entries()
