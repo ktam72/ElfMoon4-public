@@ -6,6 +6,10 @@ elfmoon/spike/
 # 参照用に clone した外部リポジトリ（antirez/ds4）
 ref-ds4/
 
+# 設計ドキュメント・変更記録（コミット対象外）
+evidence/
+docs/
+
 # ログ・一時ファイル
 *.log
 logs/
