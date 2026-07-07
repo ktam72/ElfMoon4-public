@@ -11,13 +11,15 @@ OpenAI 互換 API サーバーと対話 CLI を同梱。Claude Code / Continue.d
 | | llama.cpp (expert-offload) | **ElfMoon** |
 |---|---|---|
 | メモリ使用量 | 16 GB（全 expert 常駐） | **6.9 GB**（ストリーミング） |
-| 最低要件 | 48GB 以上の Mac | **24GB でも動作** |
+| ストレージ | GGUF 1ファイル ~16GB | **~47GB（元モデル+分解済 expert）※** |
 | セットアップ | GGUF 変換が必要 | **MLX 4bit を直接ロード** |
 | API 互換性 | llama.cpp 独自 | **OpenAI 互換** |
 | サーバ再起動 | キャッシュ消失 | **KV Cache ディスク永続化** |
 | 速度（35B MoE, 24GB） | メモリ不足で動作不可 | **25 t/s** |
 
 ElfMoon は全 expert を GPU に載せるのではなく、アクティブな expert だけを SSD からストリーミングロードする。ホットな expert は LRU キャッシュ（6144 スロット）に保持。これにより 24GB の Mac でも大規模 MoE モデルを実用的な速度で使える。
+
+※ 元モデル（~19GB）は expert 分解後に削除可能。expert のみで **~28GB** で運用できる。
 
 ---
 
@@ -55,13 +57,16 @@ python3 integrate.py split_all ../models/qwen3.6-35b-mlx
 
 ```bash
 cd elfmoon
-python3 chat.py                # 常駐 6144（既定）
-python3 chat.py 2048           # 省メモリ
+python3 chat.py                       # 常駐 6144（既定）
+python3 chat.py 2048                  # 省メモリ
+python3 chat.py --no-think            # 思考プロセスを非表示
+python3 chat.py 2048 --no-think       # 組合せ
 ```
 
 - モデルを 1 回ロードするだけで対話ループ
 - 会話履歴を保持するので続きの相談も可能
 - 日本語・英語どちらでも可
+- `--no-think` を指定すると think ブロックを非表示にし、回答のみ表示。思考中は `...` が進捗として表示される
 - `exit` で終了
 
 **向いている用途**: ちょっとしたコード生成、質問、調査。
@@ -69,7 +74,8 @@ python3 chat.py 2048           # 省メモリ
 ### API サーバー（外部ツールから使う）: api_server.py
 
 ```bash
-python3 elfmoon/api_server.py
+python3 elfmoon/api_server.py              # 通常起動
+python3 elfmoon/api_server.py --no-think   # 思考プロセス非表示
 # → http://localhost:11434 で起動
 ```
 

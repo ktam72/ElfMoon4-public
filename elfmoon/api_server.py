@@ -49,6 +49,26 @@ DEFAULT_CAPACITY = 6144
 MAX_TOKENS = 4096
 MAX_PROMPT_TOKENS = 4096
 TEMP = 0.6
+NO_THINK = "--no-think" in sys.argv
+
+
+_think_buf = ""
+_think_skip = True
+
+
+def _strip_think_text(piece):
+    global _think_buf, _think_skip
+    if not _think_skip:
+        return piece
+    _think_buf += piece
+    idx = _think_buf.find("</think>")
+    if idx >= 0:
+        _think_skip = False
+        after = _think_buf[idx + 8 :]
+        _think_buf = ""
+        return after if after else None
+    return None
+
 
 model = None
 tokenizer = None
@@ -228,6 +248,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 if not piece:
                     continue
                 n += 1
+                if NO_THINK:
+                    piece = _strip_think_text(piece)
+                    if piece is None:
+                        continue
                 yield piece, n
         except Exception as e:
             print(
