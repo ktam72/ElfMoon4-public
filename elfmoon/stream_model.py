@@ -1,39 +1,220 @@
 """最終統合: mlx_lm の Qwen3-Coder の各層MoEを ElfMoon ストリーミングMoEに差し替える。
 融合 switch_mlp(16GB) を解放し、ExpertStore + ResidentCache から必要分だけ流す。
 """
-import time
-import mlx.core as mx
-import mlx.nn as nn
-from expert_store import ExpertStore, expert_ffn, GROUP, BITS
-from resident_cache import ResidentCache
 
 import os
+import sys
+import time
+from typing import Any, List, Optional, Tuple
+
+import mlx.core as mx
+import mlx.nn as nn
+from mlx_lm.models.cache import KVCache
+from mlx_lm.models.base import create_causal_mask
+
+from expert_store import ExpertStore, GROUP, BITS
+from resident_cache import ResidentCache
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 STORE_DIR = os.path.join(_HERE, "spike/real_store")
 GATE_DIR = os.path.join(_HERE, "spike/real_gates")
-MODEL_PATH = os.path.join(_HERE, "..", "models", "qwen3-coder-mlx")
+MODEL_PATH = os.path.join(_HERE, "..", "models", "qwen3.6-35b-mlx")
+
+
+# ---- A: Compiled MoE decode ----
+
+
+@mx.compile
+def _decode_moe(
+    x: mx.array,
+    w_gw: mx.array,
+    s_gw: mx.array,
+    b_gw: mx.array,
+    w_up: mx.array,
+    s_up: mx.array,
+    b_up: mx.array,
+    w_dw: mx.array,
+    s_dw: mx.array,
+    b_dw: mx.array,
+    weights: mx.array,
+    top_k: int,
+):
+    xb = mx.broadcast_to(x, (top_k, 1, x.shape[-1]))
+    g = mx.quantized_matmul(
+        xb, w_gw, s_gw, b_gw, transpose=True, group_size=GROUP, bits=BITS
+    )
+    u = mx.quantized_matmul(
+        xb, w_up, s_up, b_up, transpose=True, group_size=GROUP, bits=BITS
+    )
+    h = (g * mx.sigmoid(g)) * u
+    yo = mx.quantized_matmul(
+        h, w_dw, s_dw, b_dw, transpose=True, group_size=GROUP, bits=BITS
+    )
+    return (yo[:, 0, :] * weights[:, None]).sum(0)
+
+
+# ---- B: Fixed-size KV cache for compile-friendly attention ----
+
+
+class FixedKVCache:
+    """KV cache with pre-allocated fixed-size arrays for mx.compile compatibility.
+
+    Unlike KVCache, update_and_fetch always returns arrays of shape
+    (B, n_kv_heads, max_size, head_dim). A mask from make_mask() blocks
+    unwritten positions so mx.fast.scaled_dot_product_attention works correctly.
+    """
+
+    def __init__(self, max_size: int = 4096, step: int = 256):
+        self.keys: Optional[mx.array] = None
+        self.values: Optional[mx.array] = None
+        self.offset: int = 0
+        self.max_size = max_size
+        self.step = step
+        self._n_kv_heads = 0
+        self._head_dim = 0
+        self._v_head_dim = 0
+
+    def update_and_fetch(
+        self, keys: mx.array, values: mx.array
+    ) -> Tuple[mx.array, mx.array]:
+        prev = self.offset
+        cur_len = self.keys.shape[-2] if self.keys is not None else 0
+        need_full = cur_len < self.max_size
+
+        if need_full:
+            B, n_kv_heads = keys.shape[0], keys.shape[1]
+            if self.keys is not None and cur_len > 0:
+                k_head_dim = self.keys.shape[-1]
+                v_head_dim = self.values.shape[-1]
+                shape = (B, n_kv_heads, self.max_size, k_head_dim)
+                new_k = mx.zeros(shape, self.keys.dtype)
+                new_v = mx.zeros(shape, self.values.dtype)
+                new_k[..., :cur_len, :] = self.keys
+                new_v[..., :cur_len, :] = self.values
+                self.keys = new_k
+                self.values = new_v
+            else:
+                k_head_dim = keys.shape[-1]
+                v_head_dim = values.shape[-1]
+                shape = (B, n_kv_heads, self.max_size, k_head_dim)
+                self.keys = mx.zeros(shape, keys.dtype)
+                self.values = mx.zeros(shape, values.dtype)
+
+        S = keys.shape[-2]
+        end = prev + S
+        self.keys[..., prev:end, :] = keys
+        self.values[..., prev:end, :] = values
+        self.offset = end
+        return self.keys, self.values
+
+    def make_mask(
+        self,
+        N: int,
+        return_array: bool = False,
+        window_size: Optional[int] = None,
+    ) -> Optional[mx.array]:
+        finfo_min = mx.array(mx.finfo(mx.bfloat16).min, dtype=mx.bfloat16)
+        zero = mx.array(0, dtype=mx.bfloat16)
+        if N == 1:
+            visible = mx.arange(self.max_size) < (self.offset + N)
+            return mx.where(visible[None, None, None, :], zero, finfo_min)
+        else:
+            off = self.offset
+            q_pos = mx.arange(off, off + N, dtype=mx.int64)[:, None]
+            k_pos = mx.arange(self.max_size, dtype=mx.int64)[None, :]
+            valid = mx.arange(self.max_size) < (off + N)
+            causal = k_pos <= q_pos
+            mask = mx.where(valid[None, :] & causal, zero, finfo_min)
+            return mask[None, None, :, :]
+
+    @property
+    def state(self) -> Tuple[Optional[mx.array], Optional[mx.array]]:
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, v: Tuple[Optional[mx.array], Optional[mx.array]]):
+        self.keys, self.values = v
+        if self.keys is not None:
+            self.offset = self.keys.shape[-2]
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, n: int) -> int:
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def size(self) -> int:
+        return self.offset
+
+    def empty(self) -> bool:
+        return self.keys is None
+
+    @property
+    def nbytes(self) -> int:
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
+
+def _has_gqa_rope(attn) -> bool:
+    """Check if attention module uses GQA-style RoPE (offset kwarg)."""
+    import inspect
+
+    src = inspect.getsource(attn.__call__)
+    return "cache.offset" in src or "offset=cache" in src
+
+
+def wire_fixed_cache(model, max_kv_size: int = 4096):
+    """Replace KVCache objects with FixedKVCache so all cache arrays have static shape.
+
+    Must be called AFTER wire_streaming (model.mlp replaced).
+    The model's attention forward uses cache[index].make_mask() which
+    FixedKVCache overrides to return custom masks for padded positions.
+    """
+    layers = model.model.layers
+    n_layers = len(layers)
+    caches = [FixedKVCache(max_size=max_kv_size) for _ in range(n_layers)]
+    return caches
+
+
+# ---- Streaming MoE（MoE 層差し替え） ----
 
 
 class StreamingMoE(nn.Module):
     """層の融合MoEを置換。routerは元の量子化gateを流用、expertはストア/キャッシュから。"""
 
-    def __init__(self, layer_idx, gate, n_experts, top_k, store, cache, norm=True):
+    def __init__(
+        self,
+        layer_idx,
+        gate,
+        n_experts,
+        top_k,
+        store,
+        cache,
+        shared_exp=None,
+        shared_gate=None,
+        norm=True,
+    ):
         super().__init__()
         self.layer_idx = layer_idx
-        self.gate = gate            # 元の router（8bit量子化Linear）を流用
+        self.gate = gate
         self.n_experts = n_experts
         self.top_k = top_k
-        self._store = store         # _始まりでMLXのparam走査から除外
+        self._store = store
         self._cache = cache
+        self._shared_exp = shared_exp
+        self._shared_gate = shared_gate
         self.norm = norm
 
     def __call__(self, x):
         shp = x.shape
-        xf = x.reshape(-1, shp[-1])                 # [N, D]
-        logits = self.gate(xf).astype(mx.float32)   # [N, E]
+        xf = x.reshape(-1, shp[-1])
+        logits = self.gate(xf).astype(mx.float32)
         probs = mx.softmax(logits, axis=-1)
-        idx = mx.argpartition(-probs, self.top_k - 1, axis=-1)[:, :self.top_k]
-        w = mx.take_along_axis(probs, idx, axis=-1)  # [N, k]
+        idx = mx.argpartition(-probs, self.top_k - 1, axis=-1)[:, : self.top_k]
+        w = mx.take_along_axis(probs, idx, axis=-1)
         if self.norm:
             w = w / mx.sum(w, axis=-1, keepdims=True)
         idx_l = idx.tolist()
@@ -42,69 +223,148 @@ class StreamingMoE(nn.Module):
         N = xf.shape[0]
 
         def load(e):
-            return self._cache.get((self.layer_idx, e),
-                                   lambda e=e: self._store.load(self.layer_idx, e))
+            return self._cache.get(
+                (self.layer_idx, e), lambda e=e: self._store.load(self.layer_idx, e)
+            )
 
         if N == 1:
-            # --- デコード: 1トークンのk expertをstackして3回のバッチmatmul ---
             experts = [load(e) for e in idx_l[0]]
-            st = lambda key: mx.stack([e[key] for e in experts])
-            xb = mx.broadcast_to(xf[0].reshape(1, 1, D), (self.top_k, 1, D))
-            g = mx.quantized_matmul(xb, st("gate.wq"), st("gate.s"), st("gate.b"),
-                                    transpose=True, group_size=GROUP, bits=BITS)
-            u = mx.quantized_matmul(xb, st("up.wq"), st("up.s"), st("up.b"),
-                                    transpose=True, group_size=GROUP, bits=BITS)
-            h = (g * mx.sigmoid(g)) * u
-            yo = mx.quantized_matmul(h, st("down.wq"), st("down.s"), st("down.b"),
-                                     transpose=True, group_size=GROUP, bits=BITS)  # [k,1,D]
-            wv = w[0].astype(yo.dtype)
-            return (yo[:, 0, :] * wv[:, None]).sum(0).reshape(shp).astype(x.dtype)
 
-        # --- プレフィル(N>1): expertごとにトークンをまとめ、1expert=1回のmatmul ---
-        from collections import defaultdict
-        groups = defaultdict(list)                    # e -> [(token, weight), ...]
+            w_gw = mx.stack([e["gate.wq"] for e in experts])
+            s_gw = mx.stack([e["gate.s"] for e in experts])
+            b_gw = mx.stack([e["gate.b"] for e in experts])
+            w_up = mx.stack([e["up.wq"] for e in experts])
+            s_up = mx.stack([e["up.s"] for e in experts])
+            b_up = mx.stack([e["up.b"] for e in experts])
+            w_dw = mx.stack([e["down.wq"] for e in experts])
+            s_dw = mx.stack([e["down.s"] for e in experts])
+            b_dw = mx.stack([e["down.b"] for e in experts])
+
+            weights = w[0].astype(mx.float16)
+            result = _decode_moe(
+                xf[0:1],
+                w_gw,
+                s_gw,
+                b_gw,
+                w_up,
+                s_up,
+                b_up,
+                w_dw,
+                s_dw,
+                b_dw,
+                weights,
+                self.top_k,
+            ).reshape(shp)
+            if self._shared_exp is not None:
+                result = result + mx.sigmoid(self._shared_gate(x)) * self._shared_exp(x)
+            return result.astype(x.dtype)
+
+        # --- プレフィル(N>1): Expert単位でトークンをバッチ処理 ---
+        expert_groups = {}
         for t in range(N):
             for j in range(self.top_k):
-                groups[int(idx_l[t][j])].append((t, w_l[t][j]))
-        out = mx.zeros((N, D))
-        for e, members in groups.items():
-            wt = load(e)
-            ts = mx.array([t for t, _ in members])
-            wv = mx.array([wv for _, wv in members]).reshape(-1, 1)
-            y = expert_ffn(xf[ts], wt) * wv           # [m, D] そのexpertの全トークンを一括
-            out = out.at[ts].add(y)                   # scatter-add
-        return out.reshape(shp).astype(x.dtype)
+                e = int(idx_l[t][j])
+                if e not in expert_groups:
+                    expert_groups[e] = []
+                expert_groups[e].append((t, w_l[t][j]))
+
+        token_buf = [None] * N
+        for e, items in expert_groups.items():
+            exp = load(e)
+            indices = [it[0] for it in items]
+            weights = [it[1] for it in items]
+            xb = xf[mx.array(indices)]
+            g = mx.quantized_matmul(
+                xb,
+                exp["gate.wq"],
+                exp["gate.s"],
+                exp["gate.b"],
+                transpose=True,
+                group_size=GROUP,
+                bits=BITS,
+            )
+            u = mx.quantized_matmul(
+                xb,
+                exp["up.wq"],
+                exp["up.s"],
+                exp["up.b"],
+                transpose=True,
+                group_size=GROUP,
+                bits=BITS,
+            )
+            h = (g * mx.sigmoid(g)) * u
+            yo = mx.quantized_matmul(
+                h,
+                exp["down.wq"],
+                exp["down.s"],
+                exp["down.b"],
+                transpose=True,
+                group_size=GROUP,
+                bits=BITS,
+            )
+            wv = mx.array(weights).astype(yo.dtype)
+            contrib = yo * wv[:, None]
+            for i, t_idx in enumerate(indices):
+                if token_buf[t_idx] is None:
+                    token_buf[t_idx] = contrib[i]
+                else:
+                    token_buf[t_idx] = token_buf[t_idx] + contrib[i]
+        out = mx.stack(token_buf).reshape(shp)
+        if self._shared_exp is not None:
+            out = out + mx.sigmoid(self._shared_gate(x)) * self._shared_exp(x)
+        return out.astype(x.dtype)
+
+
+# ---- Wiring ----
 
 
 def wire_streaming(model, capacity, top_k=8):
     """全層の mlp を StreamingMoE に差し替え、融合expertを解放。"""
     store = ExpertStore(STORE_DIR)
     cache = ResidentCache(capacity)
-    layers = model.model.layers
+    layers = getattr(model, "layers", None) or model.model.layers
     for l, layer in enumerate(layers):
         mlp = layer.mlp
         n_exp = mlp.switch_mlp.gate_proj.weight.shape[0]
         gate = mlp.gate
-        layer.mlp = StreamingMoE(l, gate, n_exp, top_k, store, cache)
-    mx.clear_cache()      # 解放された融合expertのメモリを回収
+        shared_exp = getattr(mlp, "shared_expert", None)
+        shared_gate = getattr(mlp, "shared_expert_gate", None)
+        layer.mlp = StreamingMoE(
+            l,
+            gate,
+            n_exp,
+            top_k,
+            store,
+            cache,
+            shared_exp=shared_exp,
+            shared_gate=shared_gate,
+        )
+    mx.clear_cache()  # 解放された融合expertのメモリを回収
     return cache, store
 
+
+# ---- CLI ----
 
 if __name__ == "__main__":
     import sys
     from mlx_lm import load, generate
-    cap = int(sys.argv[1]) if len(sys.argv) > 1 else 1200   # 常駐expert数
-    print(f"常駐容量={cap} experts (~{cap*2.65/1000:.1f}GB)")
+
+    cap = int(sys.argv[1]) if len(sys.argv) > 1 else 1200
+    print(f"常駐容量={cap} experts (~{cap * 2.65 / 1000:.1f}GB)")
     model, tok = load(MODEL_PATH)
     print("元モデル ロード完了。ストリーミング化中...")
     cache, store = wire_streaming(model, cap)
-    print(f"差し替え完了。常駐メモリ={mx.get_active_memory()/1e9:.2f}GB")
+    print(f"差し替え完了。常駐メモリ={mx.get_active_memory() / 1e9:.2f}GB")
 
     plen = sys.argv[2] if len(sys.argv) > 2 else "short"
     if plen == "long":
-        # 長文脈プレフィル（既存コードを文脈として与える, ~300+トークン）
-        ctx = "\n".join(f"func f{i}(_ x: Int) -> Int {{ return x * {i} + {i*i} }}" for i in range(40))
-        prompt = ctx + "\n// 上記を踏まえ、Swiftで最大公約数gcd(_:_:)を書いて。コードのみ。"
+        ctx = "\n".join(
+            f"func f{i}(_ x: Int) -> Int {{ return x * {i} + {i * i} }}"
+            for i in range(40)
+        )
+        prompt = (
+            ctx + "\n// 上記を踏まえ、Swiftで最大公約数gcd(_:_:)を書いて。コードのみ。"
+        )
     else:
         prompt = "Write a Swift function gcd(_ a: Int, _ b: Int) -> Int. Code only."
     t = time.perf_counter()
@@ -113,5 +373,7 @@ if __name__ == "__main__":
     print("=== 生成 ===")
     print(out)
     s = cache.stats()
-    print(f"命中率={s['hit_rate']*100:.1f}% (hit={s['hits']} miss={s['misses']} 常駐={s['resident']})")
+    print(
+        f"命中率={s['hit_rate'] * 100:.1f}% (hit={s['hits']} miss={s['misses']} 常駐={s['resident']})"
+    )
     print(f"時間={dt:.1f}s")

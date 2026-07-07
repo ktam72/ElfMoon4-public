@@ -10,6 +10,7 @@ ref-ds4/
 *.log
 logs/
 build/
+nohup.out
 
 # Python
 __pycache__/
