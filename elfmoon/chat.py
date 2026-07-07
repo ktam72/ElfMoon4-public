@@ -20,12 +20,18 @@ from stream_model import wire_streaming, MODEL_PATH
 SYSTEM = "You are an expert coding assistant. Write clean, correct, concise code."
 MAX_TOKENS = 4096
 MAX_HISTORY = 8
-TEMP = 0.2
+TEMP = 0.4
+
+
+_think_done = False
 
 
 def _strip_think(text_iter, no_think):
     """Strip <think> block from stream if no_think is set."""
+    global _think_done
+    _think_done = False
     if not no_think:
+        _think_done = True
         yield from text_iter
         return
     skip = True
@@ -37,7 +43,7 @@ def _strip_think(text_iter, no_think):
             idx = buf.find("</think>")
             if idx >= 0:
                 skip = False
-                # clear dots
+                _think_done = True
                 if dots:
                     print("\b" * dots + " " * dots + "\b" * dots, end="", flush=True)
                     dots = 0
@@ -46,7 +52,6 @@ def _strip_think(text_iter, no_think):
                     yield after
                 buf = ""
             else:
-                # show progress dots every ~120 chars
                 while len(buf) // 120 > dots:
                     dots += 1
                     print(".", end="", flush=True)
@@ -91,7 +96,7 @@ def main():
         )
 
         print("\033[1;32mElfMoon>\033[0m ", end="", flush=True)
-        resp, t = "", time.perf_counter()
+        resp, t, answer_t = "", time.perf_counter(), 0.0
         n = 0
         _sampler = make_sampler(temp=TEMP)
         generator = stream_generate(
@@ -108,15 +113,19 @@ def main():
 
         try:
             for piece in _strip_think(_texts(), no_think):
+                if answer_t == 0.0:
+                    answer_t = time.perf_counter()
                 print(piece, end="", flush=True)
                 resp += piece
                 n += 1
         except Exception:
             pass
 
-        dt = time.perf_counter() - t
+        elapsed = (
+            (time.perf_counter() - answer_t) if answer_t else (time.perf_counter() - t)
+        )
         print(
-            f"\n\033[2m（{n} tokens, {n / dt:.1f} tok/s, 命中率{cache.hit_rate * 100:.0f}%）\033[0m"
+            f"\n\033[2m（{n} tokens, {n / elapsed:.1f} tok/s, 命中率{cache.hit_rate * 100:.0f}%）\033[0m"
         )
         messages.append({"role": "assistant", "content": resp})
 
