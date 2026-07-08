@@ -18,7 +18,7 @@ from mlx_lm.sample_utils import make_sampler
 from stream_model import wire_streaming, MODEL_PATH
 
 SYSTEM = "You are an expert coding assistant. Write clean, correct, concise code."
-MAX_TOKENS = 4096
+MAX_TOKENS = 8192
 MAX_HISTORY = 8
 TEMP = 0.4
 

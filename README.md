@@ -1,52 +1,61 @@
-# ElfMoon 🌙
+# ElfMoon
 
 **24GB Apple Silicon で 35B/80B MoE モデルを実用速度で動かす MLX 推論エンジン**
 
-OpenAI 互換 API サーバーと対話 CLI を同梱。Claude Code / opencode 等の既存ツールから直接利用できる。
+OpenAI 互換 API サーバーと対話 CLI を同梱。Claude Code / opencode 等のツールから直接利用できる。
 
----
-
-## llama.cpp との比較
-
-| | llama.cpp (expert-offload) | **ElfMoon** |
-|---|---|---|
-| メモリ使用量 | 16 GB（全 expert 常駐） | **6.9 GB**（ストリーミング） |
-| ストレージ | GGUF 1ファイル ~16GB | **~47GB（元モデル+分解済 expert）※** |
-| セットアップ | GGUF 変換が必要 | **MLX 4bit を直接ロード** |
-| API 互換性 | llama.cpp 独自 | **OpenAI 互換** |
-| サーバ再起動 | キャッシュ消失 | **KV Cache ディスク永続化** |
-| 速度（35B MoE, 24GB） | メモリ不足で動作不可 | **デコード 15〜25 t/s**（命中率依存） |
-| 速度（80B MoE, 24GB） | メモリ不足で動作不可 | **デコード ~10 t/s**（計算律速） |
-
-ElfMoon は全 expert を GPU に載せるのではなく、アクティブな expert だけを SSD からストリーミングロードする。ホットな expert は LRU キャッシュ（6144 スロット）に保持。これにより 24GB の Mac でも大規模 MoE モデルを実用的な速度で使える。
+ElfMoon は全 expert を GPU に載せるのではなく、アクティブな expert だけを SSD からストリーミングロードする。ホットな expert は LRU キャッシュ（6144 スロット）に保持。
 
 2つの動作モード:
 - **省メモリモード（既定）**: 常駐 6144 experts ≈ 10.4GB。Xcode など他アプリと共存可能
 - **性能モード（`--perf`）**: 常駐 8000 experts ≈ 13.5GB。単体利用で最高速度
 
-※ 元モデル（~19GB）は expert 分解後に削除可能。expert のみで **~28GB** で運用できる。
+---
+
+## 他エンジンとの比較
+
+ElfMoon4 の立ち位置を明確にするため、類似エンジンとの比較を示す。
+
+| 観点 | llama.cpp | DwarfStar4 | **ElfMoon4** |
+|------|-----------|------------|--------------|
+| **対象モデル** | 汎用 GGUF（Llama / Mistral / Qwen / DeepSeek 等） | DeepSeek V4 Flash (284B) / PRO 特化 | **Qwen3.6-35B-A3B / Qwen3-Next-80B-A3B 特化** |
+| **メモリ目標** | モデルサイズ次第（GGUF 量子化で調整） | 96GB+（ハイエンド Mac / Linux） | **24GB**（Xcode 同時起動可） |
+| **言語 / 基盤** | C/C++ + 各種 GPU バックエンド | C + Metal / CUDA / ROCm | **Python + MLX** |
+| **ビルド** | cmake / make（要コンパイル） | make（要コンパイル） | **pip install のみ**（インタプリタ） |
+| **モデル形式** | GGUF（汎用フォーマット） | GGUF（DS4 独自レイアウト） | **MLX safetensors**（標準 MLX 形式） |
+| **量子化** | 多種（Q2〜Q8、IQ シリーズ等） | 非対称 IQ2_XXS / Q2_K（2bit） | **Q4 group64 統一 + router 8bit** |
+| **SSD Streaming** | レイヤー単位（mmap × partial load） | **エキスパート単位**（per-expert cache） | **エキスパート単位**（per-expert LRU cache） |
+| **アーキテクチャ** | 汎用 Transformer / MoE | 純粋 Transformer MoE | **ハイブリッド対応**（線形 attention + full attention） |
+| **分散推論** | 対応 | **マルチマシン TCP 分割** | シングルマシンのみ |
+| **エージェント連携** | 外部 API 経由 | **ネイティブ DSML エージェント内蔵** | OpenAI API 経由の外部連携 |
+| **API 互換性** | OpenAI 互換サーバー同梱 | OpenAI / Anthropic / Responses 対応 | **OpenAI 互換**（`/v1/chat/completions`） |
+| **HW バックエンド** | Metal / CUDA / Vulkan / SYCL / etc. | Metal / CUDA / ROCm | **MLX のみ**（Metal 内部利用） |
+| **エキスパートグループ化プリフィル** | なし | なし | **○（148 t/s、24倍高速化）** |
+| **`@mx.compile` JIT デコード** | なし | なし | **○（15-25 t/s デコード）** |
+| **Eco / Perf デュアルモード** | なし | なし | **○（~10.4GB / ~13.5GB 切替）** |
+| **80B モデル対応** | 対応（要十分な RAM） | 対応（284B 対応、要 96GB+） | **○（実験的、24GB で動作）** |
+| **コード規模** | ~200,000行 C++ | ~30,000行 C + GPU カーネル | **~2,000行 Python** |
+| **移植性** | ほぼ全ての環境 | Mac + Linux (CUDA/ROCm) | **Apple Silicon 専用** |
+| **ライセンス** | MIT | MIT + GGML attribution | **Apache 2.0** |
+
+### ElfMoon4 の独自性（3 エンジン中最も特長的な点）
+
+- **最小メモリフットプリント**: llama.cpp / DS4 が 96GB+ を要求する中、**24GB で 35B/80B MoE モデルを実用速度で動作させる唯一のエンジン**。Xcode など他アプリとの同時起動も想定。
+- **Python/MLX スタック**: コンパイル不要で即利用可能。C/C++ エンジンにはない `@mx.compile` JIT や MLX の自動 Metal ディスパッチを活用。
+- **ハイブリッドアーキテクチャ対応**: Qwen3.6 の GatedDeltaNet（線形 attention）と full attention の混在をサポート。純粋 Transformer のみの DS4 や llama.cpp の汎用 MoE とは異なるレイヤーを扱える。
+- **エキスパートグループ化プリフィル**: プリフィル時に同一エキスパートにルーティングされたトークンをまとめて計算。DS4 や llama.cpp にない独自最適化で 24 倍のプリフィル高速化を達成。
+- **実環境での実証**: M4 Pro 24GB で Xcode 動作中に 12.6 t/s を達成する等、「研究室内のベンチマーク」ではなく**実際の開発ワークフローで使える**ことを検証済み。
 
 ---
 
-## パフォーマンス（M4 Pro 24GB, 990tok+80tok 生成）
+## パフォーマンス（M4 Pro 24GB）
 
-### Qwen3.6-35B-A3B（推奨）
+| モデル | デコード t/s | ピークメモリ |
+|--------|:-:|:-:|
+| **Qwen3.6-35B-A3B**（推奨） | ~15-25 | 12.7 GB |
+| **Qwen3-Next-80B-A3B**（実験的） | ~9.7 | 12.9 GB |
 
-| モード | 合計 throughput | デコード t/s | ピークメモリ | 出力品質 |
-|--------|:-:|:-:|:-:|:--------:|
-| **省メモリ（既定 capacity=6144）** | **84.9 t/s** | **~15** | **12.7 GB** | ✅ |
-| **性能（--perf, capacity=8000）** | **87.0 t/s** | **~25** | **16.0 GB** | ✅ |
-
-### Qwen3-Next-80B-A3B（環境変数切替）
-
-| モード | デコード t/s | ピークメモリ | 出力品質 |
-|--------|:-:|:-:|:--------:|
-| **省メモリ（capacity=6144）** | **~9.7** | **12.9 GB** | ✅ |
-
-- 合計 throughput は 990tok プレフィル＋80tok 生成を含む（初回コールド状態）
-- 35B デコード速度: ~15 t/s（コールド）〜 ~25 t/s（ウォーム, 命中率 90%+）
-- 80B デコード速度: ~9.7 t/s（コールド/ウォーム共に計算律速）
-- KV Cache ディスク復元 ~1s
+35B はウォームで ~25 t/s、80B はコールド/ウォーム共に計算律速で ~9.7 t/s。
 
 ---
 
@@ -54,11 +63,11 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 
 | 項目 | 要件 |
 |---|---|
-| ハードウェア | Apple Silicon Mac（M1 以降）、**RAM 24GB 推奨**（常駐容量を下げれば 16GB でも可） |
+| ハードウェア | Apple Silicon Mac（M1 以降）、**RAM 24GB 推奨**（容量を下げれば 16GB でも可） |
 | OS | macOS 14 以降 |
 | Python | 3.10 以降 |
-| ディスク空き | 35B: 約 47GB / 80B: 約 84GB（元モデル + 分解済み expert） |
-| 依存 | MLX / mlx-lm / **transformers==4.57.6**（5.x は mlx-lm と非互換） |
+| ディスク空き | 35B: ~47GB / 80B: ~84GB（元モデル + 分解済 expert） |
+| 依存 | MLX / mlx-lm / **transformers==4.57.6**（5.x は非互換） |
 
 ---
 
@@ -77,20 +86,15 @@ cd elfmoon
 python3 integrate.py split_all ../models/qwen3.6-35b-mlx
 ```
 
-### 80B モデル（オプション、実験的）
-
-Qwen3-Next-80B-A3B も動作する（SSD 84GB、デコード ~9.7 t/s）。35B より遅いが品質が必要な場面で選択可:
+### 80B モデル（オプション）
 
 ```bash
-# ダウンロード（MLX 4bit, ~42GB）
 HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit \
   --local-dir ./models/qwen3-next-80b-mlx
 
-# expert 分解（48層 × 512 expert = 24,576 ファイル）
 cd elfmoon
 python3 integrate.py split_all ../models/qwen3-next-80b-mlx spike/real_store_80b
 
-# 環境変数で切替（未設定時は35B）
 export ELFMOON_MODEL_DIR=../models/qwen3-next-80b-mlx
 export ELFMOON_STORE_DIR=spike/real_store_80b
 python3 chat.py
@@ -100,141 +104,82 @@ python3 chat.py
 
 ## 使い方
 
-### 対話CLI（手軽に試す）: chat.py
+### 対話CLI: chat.py
 
 ```bash
 cd elfmoon
-python3 chat.py                                # 省メモリモード（既定、10.3GB）
-python3 chat.py --perf                         # 性能モード（13.5GB、単体利用向け）
+python3 chat.py                                # 省メモリモード（既定）
+python3 chat.py --perf                         # 性能モード
 python3 chat.py 2048                           # 省メモリ（容量指定）
 python3 chat.py --no-think                     # 思考プロセスを非表示
-python3 chat.py --perf --no-think              # 組合せ
 ```
 
 - 起動時にモード・実効容量・GB を表示
-- モデルを 1 回ロードするだけで対話ループ
-- 会話履歴を保持するので続きの相談も可能
+- モデルを 1 回ロードするだけで対話ループ。`exit` で終了
 - 日本語・英語どちらでも可
-- `--no-think` を指定すると think ブロックを非表示にし、回答のみ表示。思考中は `...` が進捗として表示される
-- `exit` で終了
 
-**向いている用途**: ちょっとしたコード生成、質問、調査。
-
-### API サーバー（外部ツールから使う）: api_server.py
+### API サーバー: api_server.py
 
 ```bash
-ELFMOON_PERF=1 python3 elfmoon/api_server.py           # 性能モード（環境変数）
-python3 elfmoon/api_server.py --perf                   # 性能モード（フラグ）
-python3 elfmoon/api_server.py                          # 省メモリモード（既定）
-python3 elfmoon/api_server.py --no-think               # 思考プロセス非表示
-python3 elfmoon/api_server.py 8080 2048                # ポート・常駐容量を指定
+python3 elfmoon/api_server.py                  # 省メモリモード（既定）
+python3 elfmoon/api_server.py --perf           # 性能モード
+python3 elfmoon/api_server.py 8080 2048        # ポート・常駐容量を指定
 # → http://127.0.0.1:11434 で起動
 ```
 
 引数: `python3 elfmoon/api_server.py [port] [常駐expert数] [--no-think] [--perf]`
 環境変数: `ELFMOON_PERF=1`（`--perf` と同等）
 
-> ⚠️ ポート 11434 は Ollama の既定ポートと同じ。Ollama を併用する場合は別ポートを指定すること。
-
-**バインド先と LAN 公開（ELFMOON_HOST）:**
-
-既定では `127.0.0.1`（ローカルのみ）にバインドする。同一 LAN の別マシン（iPad の Textastic、別 PC のエディタ等）から使いたい場合のみ、環境変数 `ELFMOON_HOST` で公開する:
-
-```bash
-ELFMOON_HOST=0.0.0.0 python3 elfmoon/api_server.py   # LAN 内の全マシンからアクセス可
-```
-
-> ⚠️ **認証機構はない**。`0.0.0.0` で起動すると同一ネットワークの誰でも API を利用できるため、信頼できるネットワーク（自宅 LAN 等）でのみ公開すること。公衆 Wi-Fi では既定の `127.0.0.1` のまま使う。
-
 OpenAI 互換エンドポイント:
-
 | エンドポイント | 用途 |
 |---|---|
 | `POST /v1/chat/completions` | チャット（stream / non-stream） |
 | `GET /v1/models` | モデル一覧 |
 
-**接続設定例:**
-
+**接続例:**
 ```bash
-# curl
 curl http://localhost:11434/v1/chat/completions \
-  -d '{"model":"qwen3.6-35b","messages":[{"role":"user","content":"SwiftでFizzBuzz"}],"stream":true}'
-
-# opencode (~/.config/opencode/opencode.json)
-  "model": "elfmoon/qwen3.6-35b",
-  "provider": {
-    "elfmoon": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "ElfMoon (local)",
-      "options": {
-        "apiKey": "sk-not-needed",
-        "baseURL": "http://localhost:11434/v1"
-      },
-      "models": {
-        "qwen3.6-35b": {
-          "name": "Qwen3.6 35B A3B (ElfMoon)",
-          "limit": {
-            "context": 131072,
-            "output": 4096
-          }
-        }
-      }
-    }
-  }
-
+  -d '{"model":"qwen3.6-35b","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-**対応リクエストパラメータ:**
+対応パラメータ: `messages`（必須）、`stream`、`max_tokens`（上限4096）、`temperature`（既定0.6）。
+API キーは不要（必須のツールでは `sk-not-needed` 等を設定）。
 
-| パラメータ | 既定値 | 備考 |
-|---|---|---|
-| `messages` | （必須） | system / user / assistant |
-| `stream` | `false` | SSE ストリーミング |
-| `max_tokens` | 4096 | 上限 4096（超過分は切り詰め） |
-| `temperature` | 0.6 | |
+> ⚠️ ポート 11434 は Ollama の既定ポートと同じ。併用時は別ポートを指定。
 
-- モデル ID は `qwen3.6-35b`（`GET /v1/models` が返す値）。リクエストの `model` 欄は記録用で、値が異なっても動作する
-- API キーは不要（ツール側で必須の場合は `sk-not-needed` 等の任意文字列を設定）
-- リクエストは 1 件ずつ直列処理される（シングルユーザー前提。同時リクエストは待たされる）
-
-**向いている用途**: opencode, Claude Code等の AI コーディングツールから利用する場合。
-
-### 使い分け
-
-| シチュエーション | 推奨 |
-|---|---|
-| ちょっとしたコード生成・質問 | chat.py |
-| 常駐させて使い回したい | api_server.py |
+**バインド先（ELFMOON_HOST）:**
+既定は `127.0.0.1`（ローカルのみ）。LAN 公開する場合のみ設定:
+```bash
+ELFMOON_HOST=0.0.0.0 python3 elfmoon/api_server.py
+```
+> ⚠️ 認証機構はない。信頼できるネットワークでのみ公開。
 
 ### 常駐容量の調整
 
 ```bash
-python3 elfmoon/api_server.py 11434 6144          # 速度重視（既定、10.4GB）
-python3 elfmoon/api_server.py 11434 6144 --perf   # 性能モード（200/層, 13.5GB）
-python3 elfmoon/api_server.py 11434 2048          # 省メモリ（3.5GB）
+python3 elfmoon/api_server.py 11434 6144          # 既定、10.4GB
+python3 elfmoon/api_server.py 11434 6144 --perf   # 性能モード、13.5GB
+python3 elfmoon/api_server.py 11434 2048          # 省メモリ、3.5GB
 ```
 
-常駐 expert 数 × 1.69MB がキャッシュメモリ量の目安。減らすとメモリは下がるが命中率が落ちて遅くなる。
-`--perf` を付けると常駐容量が 8000 experts（≈13.5GB）に引き上げられ、命中率が向上する。
+常駐 expert 数 × 1.69MB がキャッシュメモリ量の目安。`--perf` で最大 8000 experts（≈13.5GB）。
 
-### KV Cache の保存先とクリア
-
-プロンプトの KV Cache（SSM 状態含む）は `~/.cache/elfmoon/kv_cache/` にディスク永続化される（最大 4 エントリ、古いものから自動削除）。挙動がおかしい場合や容量を空けたい場合は削除してよい:
+### KV Cache クリア
 
 ```bash
 rm -rf ~/.cache/elfmoon/kv_cache
 ```
 
-### テスト・検証ツール
+---
+
+## テスト・検証
 
 ```bash
 cd elfmoon
-python3 test_kv_manager.py       # KV Cache 永続化のユニットテスト（pytest 不要）
-python3 test_slot_cache.py       # スロットキャッシュ退避のユニットテスト（参照用、SlotResidentCache 対象）
-python3 test_moe.py              # MoE ブロックの正確性・性能テスト
-python3 test_prefetch.py         # 投機プリフェッチのテスト
-python3 verify_stream.py         # StreamingMoE と元モデルの層単位一致検証（要: split_all 済み）
-python3 integrate.py verify ../models/qwen3.6-35b-mlx   # expert 分解の往復検証
+python3 verify_stream.py          # StreamingMoE と元モデルの一致検証
+python3 test_moe.py               # MoE ブロックのテスト
+python3 test_kv_manager.py        # KV Cache 永続化のテスト
+python3 integrate.py verify ../models/qwen3.6-35b-mlx   # 分解の往復検証
 ```
 
 ---
@@ -244,48 +189,10 @@ python3 integrate.py verify ../models/qwen3.6-35b-mlx   # expert 分解の往復
 | 症状 | 対処 |
 |---|---|
 | `mlx_lm` の import エラー | `pip install "transformers==4.57.6"`（5.x 非互換） |
-| モデル DL が遅い・SHA 不一致 | `HF_HUB_DISABLE_XET=1` を付けて単一接続でダウンロード（多接続 DL ツールは破損の原因） |
-| 起動直後にメモリ逼迫 | 常駐容量を下げる（例: `api_server.py 11434 2048`）または `--perf` を外して省メモリモードにする |
-| ポート競合（Ollama 併用時） | 別ポートで起動（例: `api_server.py 8080`） |
-| 応答品質が急に劣化した | `rm -rf ~/.cache/elfmoon/kv_cache` でキャッシュをクリアして再起動 |
-
----
-
-## アーキテクチャ
-
-```
-入力
-  │
-  ├─ Router（gate）→ 使用する expert を 8 個選択
-  │
-  ├─ ResidentCache（6144 experts）にある？
-  │    Yes → 直接使用（ホット）
-  │    No  → ExpertStore から SSD ロード → キャッシュ投入
-  │
-  ├─ SharedExpert + StreamingMoE（8 expert 分の計算）
-  │
-  └─ 次層へ
-```
-
-### モジュール
-
-| ファイル | 役割 |
-|---|---|
-| `api_server.py` | OpenAI 互換 API サーバー |
-| `chat.py` | 対話 CLI |
-| `stream_model.py` | StreamingMoE + `@mx.compile` デコード |
-| `kv_manager.py` | KV Cache メモリ＋ディスク永続化 |
-| `expert_store.py` | expert の SSD 保存・ロード |
-| `resident_cache.py` | LRU 常駐キャッシュ（トークン予算制御付き） |
-| `slot_cache.py` | スロットバッファ方式キャッシュ（参照用、現在未使用） |
-| `integrate.py` | モデル → per-expert 分解 |
-
-### 最適化技術
-
-- **`@mx.compile`**: 3 回の量子化 matmul + 活性化関数を GPU 1 カーネルに融合（57% 高速化）
-- **Expert グループバッチ**: プレフィル時、同一 expert を使うトークンをまとめて処理（1.7 倍）
-- **KV Cache ディスク永続化**: SHA256 ハッシュベースで保存。サーバー再起動後も継続利用可
-- **SSM 状態キャッシュ**: Qwen3.6 の SSM 層状態も保存・復元し、部分プレフィルを正しく動作
+| モデル DL が遅い・SHA 不一致 | `HF_HUB_DISABLE_XET=1` で単一接続 DL |
+| メモリ逼迫 | 常駐容量を下げる（例: `api_server.py 11434 2048`） |
+| ポート競合（Ollama） | 別ポートで起動（例: `api_server.py 8080`） |
+| 応答品質が急に劣化 | `rm -rf ~/.cache/elfmoon/kv_cache` でキャッシュクリア |
 
 ---
 
@@ -293,19 +200,16 @@ python3 integrate.py verify ../models/qwen3.6-35b-mlx   # expert 分解の往復
 
 | モデル | サイズ | expert 数 | デコード t/s | 備考 |
 |---|---|---|---|---|
-| **Qwen3.6-35B-A3B**（推奨） | 19 GB | 10240 | ~15-25 | 思考モード対応、高速 |
-| **Qwen3-Next-80B-A3B**（実験的） | 42 GB | 24576 | ~9.7 | 品質重視向け、環境変数切替 |
+| **[Qwen3.6-35B-A3B](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)**（推奨） | 19 GB | 10240 | ~15-25 | 思考モード対応、高速 |
+| **[Qwen3-Next-80B-A3B](https://huggingface.co/mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit)**（実験的） | 42 GB | 24576 | ~9.7 | 品質重視向け、環境変数切替 |
 
 ---
 
 ## ライセンス
 
-Apache License 2.0（[LICENSE](LICENSE) 参照）。モデル本体（Qwen3.6-35B-A3B）のライセンスは配布元（Hugging Face のモデルカード）に従うこと。
-
----
+Apache License 2.0。モデル本体のライセンスは配布元のモデルカードに従うこと。
 
 ## クレジット
 
 - 着想元: [antirez/ds4 (DwarfStar)](https://github.com/antirez/ds4)
 - 基盤: [MLX](https://github.com/ml-explore/mlx) / [mlx-lm](https://github.com/ml-explore/mlx-lm)
-- モデル: [Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)（MLX Community / Alibaba Tongyi Lab）

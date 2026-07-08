@@ -48,7 +48,7 @@ HOST = os.environ.get("ELFMOON_HOST", "127.0.0.1")
 DEFAULT_PORT = 11434
 DEFAULT_CAPACITY = 6144
 MODEL_ID = "qwen3.6-35b"
-MAX_TOKENS = 4096
+MAX_TOKENS = 8192
 TEMP = 0.6
 NO_THINK = "--no-think" in sys.argv
 
