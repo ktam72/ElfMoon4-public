@@ -12,9 +12,20 @@ from expert_store import ExpertStore, GROUP, BITS
 from resident_cache import ResidentCache
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-STORE_DIR = os.path.join(_HERE, "spike/real_store")
-GATE_DIR = os.path.join(_HERE, "spike/real_gates")
-MODEL_PATH = os.path.join(_HERE, "..", "models", "qwen3.6-35b-mlx")
+
+# 環境変数でモデル切替。未設定時は現行のシンボリックリンク先（後方互換）
+MODEL_PATH = os.environ.get(
+    "ELFMOON_MODEL_DIR",
+    os.path.join(_HERE, "..", "models", "qwen3.6-35b-mlx"),
+)
+STORE_DIR = os.environ.get(
+    "ELFMOON_STORE_DIR",
+    os.path.join(_HERE, "spike/real_store"),
+)
+GATE_DIR = os.environ.get(
+    "ELFMOON_GATE_DIR",
+    os.path.join(_HERE, "spike/real_gates"),
+)
 
 
 # ---- A: Compiled MoE decode ----
