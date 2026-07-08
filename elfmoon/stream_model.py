@@ -34,6 +34,7 @@ def _decode_moe(
     b_dw: mx.array,
     weights: mx.array,
     top_k: int,
+    shared=None,
 ):
     xb = mx.broadcast_to(x, (top_k, 1, x.shape[-1]))
     g = mx.quantized_matmul(
@@ -46,7 +47,39 @@ def _decode_moe(
     yo = mx.quantized_matmul(
         h, w_dw, s_dw, b_dw, transpose=True, group_size=GROUP, bits=BITS
     )
-    return (yo[:, 0, :] * weights[:, None]).sum(0)
+    result = (yo[:, 0, :] * weights[:, None]).sum(0)
+    if shared is not None:
+        (
+            sg_w,
+            sg_s,
+            sg_b,
+            sg_bits,
+            sg_gs,
+            se_gw,
+            se_gs,
+            se_gb,
+            se_uw,
+            se_us,
+            se_ub,
+            se_dw,
+            se_ds,
+            se_db,
+        ) = shared
+        sg = mx.quantized_matmul(
+            x, sg_w, sg_s, sg_b, transpose=True, group_size=sg_gs, bits=sg_bits
+        )
+        se_g = mx.quantized_matmul(
+            x, se_gw, se_gs, se_gb, transpose=True, group_size=GROUP, bits=BITS
+        )
+        se_u = mx.quantized_matmul(
+            x, se_uw, se_us, se_ub, transpose=True, group_size=GROUP, bits=BITS
+        )
+        se_h = (se_g * mx.sigmoid(se_g)) * se_u
+        se_out = mx.quantized_matmul(
+            se_h, se_dw, se_ds, se_db, transpose=True, group_size=GROUP, bits=BITS
+        )
+        result = result + mx.sigmoid(sg) * se_out
+    return result
 
 
 # ---- Streaming MoE（MoE 層差し替え） ----
@@ -74,9 +107,29 @@ class StreamingMoE(nn.Module):
         self.top_k = top_k
         self._store = store
         self._cache = cache
-        self._shared_exp = shared_exp
-        self._shared_gate = shared_gate
         self.norm = norm
+
+        if shared_exp is not None:
+            sg = shared_gate
+            se = shared_exp
+            self._shared = (
+                sg.weight,
+                sg.scales,
+                sg.biases,
+                sg.bits,
+                sg.group_size,
+                se.gate_proj.weight,
+                se.gate_proj.scales,
+                se.gate_proj.biases,
+                se.up_proj.weight,
+                se.up_proj.scales,
+                se.up_proj.biases,
+                se.down_proj.weight,
+                se.down_proj.scales,
+                se.down_proj.biases,
+            )
+        else:
+            self._shared = None
 
     def __call__(self, x):
         shp = x.shape
@@ -88,8 +141,6 @@ class StreamingMoE(nn.Module):
         if self.norm:
             w = w / mx.sum(w, axis=-1, keepdims=True)
         idx_l = idx.tolist()
-        w_l = w.tolist()
-        D = shp[-1]
         N = xf.shape[0]
 
         def load(e):
@@ -124,12 +175,12 @@ class StreamingMoE(nn.Module):
                 b_dw,
                 weights,
                 self.top_k,
+                shared=self._shared,
             ).reshape(shp)
-            if self._shared_exp is not None:
-                result = result + mx.sigmoid(self._shared_gate(x)) * self._shared_exp(x)
             return result.astype(x.dtype)
 
         # --- プレフィル(N>1): Expert単位でトークンをバッチ処理 ---
+        w_l = w.tolist()
         expert_groups = {}
         for t in range(N):
             for j in range(self.top_k):
@@ -180,18 +231,62 @@ class StreamingMoE(nn.Module):
                 else:
                     token_buf[t_idx] = token_buf[t_idx] + contrib[i]
         out = mx.stack(token_buf).reshape(shp)
-        if self._shared_exp is not None:
-            out = out + mx.sigmoid(self._shared_gate(x)) * self._shared_exp(x)
+        if self._shared is not None:
+            (
+                sg_w,
+                sg_s,
+                sg_b,
+                sg_bits,
+                sg_gs,
+                se_gw,
+                se_gs,
+                se_gb,
+                se_uw,
+                se_us,
+                se_ub,
+                se_dw,
+                se_ds,
+                se_db,
+            ) = self._shared
+            sg = mx.quantized_matmul(
+                xf, sg_w, sg_s, sg_b, transpose=True, group_size=sg_gs, bits=sg_bits
+            )
+            se_g = mx.quantized_matmul(
+                xf, se_gw, se_gs, se_gb, transpose=True, group_size=GROUP, bits=BITS
+            )
+            se_u = mx.quantized_matmul(
+                xf, se_uw, se_us, se_ub, transpose=True, group_size=GROUP, bits=BITS
+            )
+            se_h = (se_g * mx.sigmoid(se_g)) * se_u
+            se_out = mx.quantized_matmul(
+                se_h, se_dw, se_ds, se_db, transpose=True, group_size=GROUP, bits=BITS
+            )
+            out = out + mx.sigmoid(sg) * se_out
         return out.astype(x.dtype)
 
 
 # ---- Wiring ----
 
 
-def wire_streaming(model, capacity, top_k=8):
-    """全層の mlp を StreamingMoE に差し替え、融合expertを解放。"""
+def wire_streaming(model, capacity, top_k=8, perf=False):
+    """全層の mlp を StreamingMoE に差し替え、融合expertを解放。
+
+    perf=True の場合、実効容量を 8000（≈13.5GB）に引き上げ。
+    """
     store = ExpertStore(STORE_DIR)
-    cache = ResidentCache(capacity)
+    if perf:
+        eff_cap = max(capacity, 8000)
+        cache = ResidentCache(eff_cap)
+        s = cache.stats()
+        print(
+            f"  性能モード: 実効容量 {s['capacity']}（{s['capacity'] * 1.69 / 1000:.1f}GB）"
+        )
+    else:
+        cache = ResidentCache(capacity)
+        s = cache.stats()
+        print(
+            f"  省メモリモード: 実効容量 {s['capacity']}（{s['capacity'] * 1.69 / 1000:.1f}GB）"
+        )
     layers = getattr(model, "layers", None) or model.model.layers
     for l, layer in enumerate(layers):
         mlp = layer.mlp
@@ -209,7 +304,7 @@ def wire_streaming(model, capacity, top_k=8):
             shared_exp=shared_exp,
             shared_gate=shared_gate,
         )
-    mx.clear_cache()  # 解放された融合expertのメモリを回収
+    mx.clear_cache()
     return cache, store
 
 
@@ -219,11 +314,13 @@ if __name__ == "__main__":
     import sys
     from mlx_lm import load, generate
 
-    cap = int(sys.argv[1]) if len(sys.argv) > 1 else 1200
-    print(f"常駐容量={cap} experts (~{cap * 1.69 / 1000:.1f}GB)")
-    model, tok = load(MODEL_PATH)
-    print("元モデル ロード完了。ストリーミング化中...")
-    cache, store = wire_streaming(model, cap)
+    cap = int(sys.argv[1]) if len(sys.argv) > 1 else 6144
+    perf = "--perf" in sys.argv
+    mode = "性能" if perf else "省メモリ"
+    print(f"常駐容量={cap} experts（{mode}モード）")
+    model, tok = load(MODEL_PATH, lazy=True)
+    print("元モデル ロード完了（lazy）。ストリーミング化中...")
+    cache, store = wire_streaming(model, cap, perf=perf)
     print(f"差し替え完了。常駐メモリ={mx.get_active_memory() / 1e9:.2f}GB")
 
     plen = sys.argv[2] if len(sys.argv) > 2 else "short"

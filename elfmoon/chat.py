@@ -60,13 +60,15 @@ def _strip_think(text_iter, no_think):
 def main():
     argv = sys.argv[1:]
     no_think = "--no-think" in argv
-    cap_strs = [a for a in argv if a != "--no-think"]
+    perf = "--perf" in argv
+    cap_strs = [a for a in argv if a not in ("--no-think", "--perf")]
     cap = int(cap_strs[0]) if cap_strs else 6144
 
-    print(f"モデルをロード中...（常駐 {cap} experts ≈ {cap * 1.69 / 1000:.1f}GB）")
+    mode = "性能" if perf else "省メモリ"
+    print(f"モデルをロード中...（{mode}モード, capacity={cap}）")
     t0 = time.perf_counter()
-    model, tok = load(MODEL_PATH)
-    cache, _ = wire_streaming(model, cap)
+    model, tok = load(MODEL_PATH, lazy=True)
+    cache, _ = wire_streaming(model, cap, perf=perf)
     print(
         f"準備完了（{time.perf_counter() - t0:.0f}秒）。"
         f"コーディングの依頼をどうぞ。'exit' か Ctrl-D で終了。\n"

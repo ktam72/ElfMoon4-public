@@ -329,7 +329,9 @@ class APIHandler(BaseHTTPRequestHandler):
         error = False
 
         try:
-            for piece, n in self._generate_cached(prompt, prompt_nogen, max_tokens, temperature):
+            for piece, n in self._generate_cached(
+                prompt, prompt_nogen, max_tokens, temperature
+            ):
                 chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -387,7 +389,9 @@ class APIHandler(BaseHTTPRequestHandler):
         pieces = []
         total = 0
         try:
-            for piece, n in self._generate_cached(prompt, prompt_nogen, max_tokens, temperature):
+            for piece, n in self._generate_cached(
+                prompt, prompt_nogen, max_tokens, temperature
+            ):
                 pieces.append(piece)
                 total = n
         except Exception as e:
@@ -448,26 +452,33 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a != "--no-think"]
+    import os
+
+    perf = "--perf" in sys.argv or os.environ.get("ELFMOON_PERF") == "1"
+    args = [a for a in sys.argv[1:] if a not in ("--no-think", "--perf")]
     port = int(args[0]) if len(args) > 0 else DEFAULT_PORT
     cap = int(args[1]) if len(args) > 1 else DEFAULT_CAPACITY
 
+    mode = "性能" if perf else "省メモリ"
     global model, tokenizer, cache
     print(
-        f"モデルをロード中...（常駐 {cap} experts ≈ {cap * 1.69 / 1000:.1f}GB）",
+        f"モデルをロード中...（{mode}モード, capacity={cap}）",
         flush=True,
     )
     t0 = time.perf_counter()
     # Load model with tokenizer using PreTrainedTokenizerFast for Qwen3.6 compat
     _tok_cfg = {"tokenizer_class": "PreTrainedTokenizerFast", "add_prefix_space": False}
-    model, tokenizer = _mlx_load(MODEL_PATH, tokenizer_config=_tok_cfg)
-    cache, _ = wire_streaming(model, cap)
+    model, tokenizer = _mlx_load(MODEL_PATH, tokenizer_config=_tok_cfg, lazy=True)
+    cache, _ = wire_streaming(model, cap, perf=perf)
     print(f"準備完了（{time.perf_counter() - t0:.0f}秒）", flush=True)
 
     print(f"", flush=True)
     print(f"  ElfMoon API サーバ起動: http://{HOST}:{port}", flush=True)
     if HOST == "127.0.0.1":
-        print(f"  （LAN公開する場合: ELFMOON_HOST=0.0.0.0 で起動。認証なし注意）", flush=True)
+        print(
+            f"  （LAN公開する場合: ELFMOON_HOST=0.0.0.0 で起動。認証なし注意）",
+            flush=True,
+        )
     print(f"  POST /v1/chat/completions  (OpenAI 互換, stream/non-stream)", flush=True)
     print(f"  GET  /v1/models", flush=True)
     print(f"", flush=True)

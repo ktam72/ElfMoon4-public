@@ -3,25 +3,25 @@
 
 先に integrate.py split_all で spike/real_store, spike/real_gates を生成しておくこと。
 """
+
 import mlx.core as mx
 from mlx_lm import load
 from stream_model import StreamingMoE, MODEL_PATH, STORE_DIR
 from expert_store import ExpertStore
 from resident_cache import ResidentCache
 
-model, tok = load(MODEL_PATH)
+model, tok = load(MODEL_PATH, lazy=True)
 layers = getattr(model, "layers", None) or model.model.layers
 store = ExpertStore(STORE_DIR)
-cache = ResidentCache(200000)   # 全部載る大容量（キャッシュ影響を排除）
+cache = ResidentCache(10240)
 
-# 隠れ次元をルーターgateから逆算（QuantizedLinear: 32/bits 値が uint32 に詰まる）
 g0 = layers[0].mlp.gate
 D = g0.weight.shape[1] * (32 // g0.bits) if hasattr(g0, "bits") else g0.weight.shape[1]
 n_layers = len(layers)
 print(f"layers={n_layers}, hidden={D}")
 
 for l in sorted({0, 1, n_layers // 2, n_layers - 1}):
-    orig = layers[l].mlp                       # 元の融合MoE
+    orig = layers[l].mlp
     mine = StreamingMoE(
         l,
         orig.gate,
@@ -32,10 +32,12 @@ for l in sorted({0, 1, n_layers // 2, n_layers - 1}):
         shared_exp=getattr(orig, "shared_expert", None),
         shared_gate=getattr(orig, "shared_expert_gate", None),
     )
-    x = mx.random.normal((1, 3, D)).astype(mx.float16)   # [B,T,D]
+    x = mx.random.normal((1, 3, D)).astype(mx.float16)
     yo = orig(x)
     ym = mine(x)
     err = float(mx.max(mx.abs(yo.astype(mx.float32) - ym.astype(mx.float32))))
     rel = err / (float(mx.max(mx.abs(yo.astype(mx.float32)))) + 1e-9)
-    print(f"layer {l:2d}: 最大誤差={err:.4e} 相対={rel:.4e} "
-          f"{'OK' if rel < 1e-2 else 'NG(ずれ)'}")
+    print(
+        f"layer {l:2d}: 最大誤差={err:.4e} 相対={rel:.4e} "
+        f"{'OK' if rel < 1e-2 else 'NG(ずれ)'}"
+    )
