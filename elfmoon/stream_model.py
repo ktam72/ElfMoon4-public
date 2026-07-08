@@ -2,6 +2,7 @@
 融合 switch_mlp（Qwen3.6-35B で約17GB）を解放し、ExpertStore + ResidentCache から必要分だけ流す。
 """
 
+import json
 import os
 import time
 
@@ -279,11 +280,29 @@ class StreamingMoE(nn.Module):
 # ---- Wiring ----
 
 
-def wire_streaming(model, capacity, top_k=8, perf=False):
+def _read_top_k():
+    """config.json から num_experts_per_tok を読み取る。
+    35B は text_config 入れ子、80B はフラット。両方対応。
+    """
+    try:
+        cfg = json.load(open(os.path.join(MODEL_PATH, "config.json")))
+        for key in ("num_experts_per_tok",):
+            v = cfg.get(key) or cfg.get("text_config", {}).get(key)
+            if v is not None:
+                return v
+    except Exception:
+        pass
+    return 8
+
+
+def wire_streaming(model, capacity, top_k=None, perf=False):
     """全層の mlp を StreamingMoE に差し替え、融合expertを解放。
 
+    top_k=None の場合、config.json の num_experts_per_tok を自動検出。
     perf=True の場合、実効容量を 8000（≈13.5GB）に引き上げ。
     """
+    if top_k is None:
+        top_k = _read_top_k()
     store = ExpertStore(STORE_DIR)
     if perf:
         eff_cap = max(capacity, 8000)
