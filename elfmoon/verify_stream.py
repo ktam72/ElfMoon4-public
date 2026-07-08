@@ -4,13 +4,16 @@
 先に integrate.py split_all で spike/real_store, spike/real_gates を生成しておくこと。
 """
 
-import mlx.core as mx
+import json, os, mlx.core as mx
 from mlx_lm import load
 from stream_model import StreamingMoE, MODEL_PATH, STORE_DIR
 from expert_store import ExpertStore
 from resident_cache import ResidentCache
 
 model, tok = load(MODEL_PATH, lazy=True)
+# config.json から top_k を自動検出（未指定時は8＝35B互換）
+cfg = json.load(open(os.path.join(MODEL_PATH, "config.json")))
+top_k = cfg.get("num_experts_per_tok", 8)
 layers = getattr(model, "layers", None) or model.model.layers
 store = ExpertStore(STORE_DIR)
 cache = ResidentCache(10240)
@@ -18,7 +21,7 @@ cache = ResidentCache(10240)
 g0 = layers[0].mlp.gate
 D = g0.weight.shape[1] * (32 // g0.bits) if hasattr(g0, "bits") else g0.weight.shape[1]
 n_layers = len(layers)
-print(f"layers={n_layers}, hidden={D}")
+print(f"layers={n_layers}, hidden={D}, top_k={top_k}")
 
 for l in sorted({0, 1, n_layers // 2, n_layers - 1}):
     orig = layers[l].mlp
@@ -26,7 +29,7 @@ for l in sorted({0, 1, n_layers // 2, n_layers - 1}):
         l,
         orig.gate,
         orig.switch_mlp.gate_proj.weight.shape[0],
-        8,
+        top_k,
         store,
         cache,
         shared_exp=getattr(orig, "shared_expert", None),

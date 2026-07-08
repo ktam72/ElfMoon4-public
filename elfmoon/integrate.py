@@ -114,6 +114,9 @@ def verify_layer0(path):
 if __name__ == "__main__":
     path = sys.argv[2] if len(sys.argv) > 2 else "../models/qwen3.6-35b-mlx"
     cmd = sys.argv[1] if len(sys.argv) > 1 else "verify"
+    # オプション: 第3引数 = store_dir、第4引数 = gate_dir（未指定時は 35B 用既定値）
+    store_dir = sys.argv[3] if len(sys.argv) > 3 else "spike/real_store"
+    gate_dir = sys.argv[4] if len(sys.argv) > 4 else "spike/real_gates"
     if cmd == "verify":
         verify_layer0(path)
     elif cmd == "split_all":
@@ -128,7 +131,7 @@ if __name__ == "__main__":
         )
         print(f"layers={n_layers}", flush=True)
         for l in range(n_layers):
-            ne = split_layer(W, l, "spike/real_store", "spike/real_gates")
+            ne = split_layer(W, l, store_dir, gate_dir)
             if l % 8 == 0:
                 print(f"  layer {l}/{n_layers} 分解済(experts={ne})", flush=True)
         print(f"完了: {n_layers}層")
