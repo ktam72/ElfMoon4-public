@@ -49,19 +49,9 @@ def router_gate_float(W, l):
     )
 
 
-def split_layer(W, l, store_dir, gate_dir):
+def split_layer(W, l, store_dir):
     os.makedirs(store_dir, exist_ok=True)
-    os.makedirs(gate_dir, exist_ok=True)
     b = _base(l)
-    # ルーターgate（floatに復元）
-    g = mx.dequantize(
-        W[f"{b}.gate.weight"],
-        W[f"{b}.gate.scales"],
-        W[f"{b}.gate.biases"],
-        group_size=GROUP,
-        bits=GATE_BITS,
-    )
-    mx.save_safetensors(os.path.join(gate_dir, f"gate_l{l}.safetensors"), {"w": g})
     # 融合expertを取得
     projs = {
         name: (
@@ -81,18 +71,13 @@ def split_layer(W, l, store_dir, gate_dir):
     return n_exp
 
 
-def verify_layer0(path, store_dir="spike/real_store", gate_dir="spike/real_gates"):
-    """分解の往復が量子化を保つか検証: 保存前スライス == 保存→ロード。
-
-    store_dir/gate_dir は呼び出し側が明示指定すること。既定値は35B本番と衝突するため
-    他モデルの検証時は必ず専用ディレクトリを渡す（衝突すると同一shapeのモデル間で
-    サイレントに上書き破損する）。
-    """
+def verify_layer0(path, store_dir="spike/real_store"):
+    """分解の往復が量子化を保つか検証: 保存前スライス == 保存→ロード。"""
     from expert_store import ExpertStore, expert_ffn
 
     W = load_shards(path)
     PREFIX[0] = _detect_prefix(W)  # split_layer が参照する prefix を設定
-    n = split_layer(W, 0, store_dir, gate_dir)
+    n = split_layer(W, 0, store_dir)
     store = ExpertStore(store_dir)
     base = f"{_base(0)}.switch_mlp"
     hidden = router_gate_float(W, 0).shape[-1]
@@ -119,11 +104,10 @@ def verify_layer0(path, store_dir="spike/real_store", gate_dir="spike/real_gates
 if __name__ == "__main__":
     path = sys.argv[2] if len(sys.argv) > 2 else "../models/qwen3.6-35b-mlx"
     cmd = sys.argv[1] if len(sys.argv) > 1 else "verify"
-    # オプション: 第3引数 = store_dir、第4引数 = gate_dir（未指定時は 35B 用既定値）
+    # オプション: 第3引数 = store_dir（未指定時は 35B 用既定値）
     store_dir = sys.argv[3] if len(sys.argv) > 3 else "spike/real_store"
-    gate_dir = sys.argv[4] if len(sys.argv) > 4 else "spike/real_gates"
     if cmd == "verify":
-        verify_layer0(path, store_dir, gate_dir)
+        verify_layer0(path, store_dir)
     elif cmd == "split_all":
         W = load_shards(path)
         PREFIX[0] = _detect_prefix(W)
@@ -136,7 +120,7 @@ if __name__ == "__main__":
         )
         print(f"layers={n_layers}", flush=True)
         for l in range(n_layers):
-            ne = split_layer(W, l, store_dir, gate_dir)
+            ne = split_layer(W, l, store_dir)
             if l % 8 == 0:
                 print(f"  layer {l}/{n_layers} 分解済(experts={ne})", flush=True)
         print(f"完了: {n_layers}層")

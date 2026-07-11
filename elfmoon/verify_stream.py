@@ -1,7 +1,7 @@
 """ストリーミングMoEが元のmlpと一致するか、実モデルで層単位検証する。
 ずれていれば我々の実装バグ。一致すれば出力品質の問題は別要因。
 
-先に integrate.py split_all で spike/real_store, spike/real_gates を生成しておくこと。
+先に integrate.py split_all で spike/real_store を生成しておくこと。
 """
 
 import json, os, mlx.core as mx

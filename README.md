@@ -109,11 +109,10 @@ HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3-Coder-Next-4bit \
   --local-dir ./models/qwen3-coder-next-4bit
 
 cd elfmoon
-python3 integrate.py split_all ../models/qwen3-coder-next-4bit spike/real_store_coder spike/real_gates_coder
+python3 integrate.py split_all ../models/qwen3-coder-next-4bit spike/real_store_coder
 
 export ELFMOON_MODEL_DIR=../models/qwen3-coder-next-4bit
 export ELFMOON_STORE_DIR=spike/real_store_coder
-export ELFMOON_GATE_DIR=spike/real_gates_coder
 python3 chat.py
 ```
 

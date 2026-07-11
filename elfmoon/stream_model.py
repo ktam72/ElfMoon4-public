@@ -23,10 +23,6 @@ STORE_DIR = os.environ.get(
     "ELFMOON_STORE_DIR",
     os.path.join(_HERE, "spike/real_store"),
 )
-GATE_DIR = os.environ.get(
-    "ELFMOON_GATE_DIR",
-    os.path.join(_HERE, "spike/real_gates"),
-)
 
 
 # ---- A: Compiled MoE decode ----
