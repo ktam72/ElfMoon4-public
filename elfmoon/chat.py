@@ -12,8 +12,14 @@
     python3 chat.py --list                # 利用可能なモデル一覧
 """
 
+import logging
 import sys
 import time
+
+# 一部モデルのカスタムtokenizer実装が動作に無関係なWARNINGログを出すため抑制する
+# （例: Kimi-Linearの tokenization_kimi.py が encode() 呼び出しごとに警告ログを出す）。
+logging.disable(logging.WARNING)
+
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
 from stream_model import wire_streaming, resolve_model, list_models, MODELS_ROOT
@@ -25,36 +31,44 @@ TEMP = 0.4
 
 
 def _strip_think(text_iter, no_think):
-    """Strip <think> block from stream if no_think is set."""
+    """Strip <think> block from stream if no_think is set.
+
+    enable_thinking=False をテンプレートが尊重するモデルは <think> タグ自体を
+    一切生成しないため、その場合はバッファせず即座に素通しする（先頭が
+    "<think" で始まらないかを数文字だけ覗き見て判定）。判定できるまでの
+    数文字はバッファするが、"<think" と確定しなければ即フラッシュする。
+    """
     if not no_think:
         yield from text_iter
         return
-    skip = True
+
+    PEEK = len("<think>")
     buf = ""
-    dots = 0
+    peeking = True
     for piece in text_iter:
-        if skip:
+        if peeking:
             buf += piece
-            idx = buf.find("</think>")
-            if idx >= 0:
-                skip = False
-                if dots:
-                    print("\b" * dots + " " * dots + "\b" * dots, end="", flush=True)
-                    dots = 0
-                after = buf[idx + 8 :]
-                if after:
-                    yield after
-                buf = ""
-            else:
-                while len(buf) // 120 > dots:
-                    dots += 1
-                    print(".", end="", flush=True)
+            if len(buf) < PEEK and "<think>".startswith(buf):
+                continue  # まだ判定に十分な文字数がない
+            peeking = False
+            if not buf.lstrip().startswith("<think"):
+                # このモデルは enable_thinking=False で think を生成しない → 即素通し
+                yield buf
+                yield from text_iter
+                return
+            # 以降は従来通り </think> まで除去するモード
         else:
-            yield piece
+            buf += piece
+        idx = buf.find("</think>")
+        if idx >= 0:
+            after = buf[idx + 8 :]
+            if after:
+                yield after
+            buf = ""
+            yield from text_iter
+            return
     # </think> が最後まで現れなかった場合、溜めた分を破棄せず出力する
-    if skip and buf:
-        if dots:
-            print("\b" * dots + " " * dots + "\b" * dots, end="", flush=True)
+    if buf:
         yield buf
 
 
@@ -111,7 +125,10 @@ def main():
             messages = [messages[0]] + messages[-MAX_HISTORY * 2 :]
 
         prompt = tok.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            enable_thinking=not no_think,
         )
 
         print("\033[1;32mElfMoon>\033[0m ", end="", flush=True)

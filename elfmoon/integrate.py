@@ -123,8 +123,14 @@ if __name__ == "__main__":
             if f"{pfx}.layers." in k
         )
         print(f"layers={n_layers}", flush=True)
+        n_dense = 0
         for l in range(n_layers):
+            base = f"{pfx + '.' if pfx else ''}layers.{l}.mlp"
+            if f"{base}.switch_mlp.gate_proj.weight" not in W:
+                # first_k_dense_replace 等で dense層(switch_mlpなし)が混在するモデル向け
+                n_dense += 1
+                continue
             ne = split_layer(W, l, store_dir)
             if l % 8 == 0:
                 print(f"  layer {l}/{n_layers} 分解済(experts={ne})", flush=True)
-        print(f"完了: {n_layers}層")
+        print(f"完了: {n_layers}層（dense層{n_dense}個はスキップ）")

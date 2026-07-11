@@ -89,25 +89,20 @@ def _decode_moe(
     )
     result = (yo[:, 0, :] * weights[:, None]).sum(0)
     if shared is not None:
-        (
-            sg_w,
-            sg_s,
-            sg_b,
-            sg_bits,
-            sg_gs,
-            se_gw,
-            se_gs,
-            se_gb,
-            se_uw,
-            se_us,
-            se_ub,
-            se_dw,
-            se_ds,
-            se_db,
-        ) = shared
-        sg = mx.quantized_matmul(
-            x, sg_w, sg_s, sg_b, transpose=True, group_size=sg_gs, bits=sg_bits
-        )
+        gated = len(shared) == 14
+        if gated:
+            (
+                sg_w, sg_s, sg_b, sg_bits, sg_gs,
+                se_gw, se_gs, se_gb,
+                se_uw, se_us, se_ub,
+                se_dw, se_ds, se_db,
+            ) = shared
+        else:
+            (
+                se_gw, se_gs, se_gb,
+                se_uw, se_us, se_ub,
+                se_dw, se_ds, se_db,
+            ) = shared
         se_g = mx.quantized_matmul(
             x, se_gw, se_gs, se_gb, transpose=True, group_size=GROUP, bits=BITS
         )
@@ -118,7 +113,13 @@ def _decode_moe(
         se_out = mx.quantized_matmul(
             se_h, se_dw, se_ds, se_db, transpose=True, group_size=GROUP, bits=BITS
         )
-        result = result + mx.sigmoid(sg) * se_out
+        if gated:
+            sg = mx.quantized_matmul(
+                x, sg_w, sg_s, sg_b, transpose=True, group_size=sg_gs, bits=sg_bits
+            )
+            result = result + mx.sigmoid(sg) * se_out
+        else:
+            result = result + se_out
     return result
 
 
@@ -139,6 +140,9 @@ class StreamingMoE(nn.Module):
         shared_exp=None,
         shared_gate=None,
         norm=True,
+        activation="softmax",
+        correction_bias=None,
+        routing_scale=1.0,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -148,16 +152,13 @@ class StreamingMoE(nn.Module):
         self._store = store
         self._cache = cache
         self.norm = norm
+        self.activation = activation
+        self.correction_bias = correction_bias
+        self.routing_scale = routing_scale
 
         if shared_exp is not None:
-            sg = shared_gate
             se = shared_exp
-            self._shared = (
-                sg.weight,
-                sg.scales,
-                sg.biases,
-                sg.bits,
-                sg.group_size,
+            se_tuple = (
                 se.gate_proj.weight,
                 se.gate_proj.scales,
                 se.gate_proj.biases,
@@ -168,6 +169,19 @@ class StreamingMoE(nn.Module):
                 se.down_proj.scales,
                 se.down_proj.biases,
             )
+            if shared_gate is not None:
+                # Qwen方式: shared_expert出力に sigmoid(gate(x)) を乗じる
+                sg = shared_gate
+                self._shared = (
+                    sg.weight,
+                    sg.scales,
+                    sg.biases,
+                    sg.bits,
+                    sg.group_size,
+                ) + se_tuple
+            else:
+                # GLM/Kimi方式: ゲートなし、shared_expert出力をそのまま加算
+                self._shared = se_tuple
         else:
             self._shared = None
 
@@ -175,11 +189,19 @@ class StreamingMoE(nn.Module):
         shp = x.shape
         xf = x.reshape(-1, shp[-1])
         logits = self.gate(xf).astype(mx.float32)
-        probs = mx.softmax(logits, axis=-1)
-        idx = mx.argpartition(-probs, self.top_k - 1, axis=-1)[:, : self.top_k]
+        if self.activation == "sigmoid":
+            probs = mx.sigmoid(logits)
+        else:
+            probs = mx.softmax(logits, axis=-1)
+        # 選択(top-k)には補正バイアス込みのスコアを使うが、重みには補正前の
+        # probs を使う（DeepSeek/Kimi式 aux-loss-free ルーティングの規約）。
+        sel_probs = probs + self.correction_bias if self.correction_bias is not None else probs
+        idx = mx.argpartition(-sel_probs, self.top_k - 1, axis=-1)[:, : self.top_k]
         w = mx.take_along_axis(probs, idx, axis=-1)
         if self.norm:
             w = w / mx.sum(w, axis=-1, keepdims=True)
+        if self.routing_scale != 1.0:
+            w = w * self.routing_scale
         idx_l = idx.tolist()
         N = xf.shape[0]
 
@@ -190,13 +212,22 @@ class StreamingMoE(nn.Module):
 
         if N == 1:
             experts = [load(e) for e in idx_l[0]]
+            k = len(experts)
 
-            w_gw = mx.stack([e["gate.wq"] for e in experts])
-            s_gw = mx.stack([e["gate.s"] for e in experts])
-            b_gw = mx.stack([e["gate.b"] for e in experts])
-            w_up = mx.stack([e["up.wq"] for e in experts])
-            s_up = mx.stack([e["up.s"] for e in experts])
-            b_up = mx.stack([e["up.b"] for e in experts])
+            # gate/up は同shape(dim→moe_inter)なので1回のstackにまとめ、
+            # down(moe_inter→dim)だけ別stackにする(9回→6回の mx.stack でカーネル起動を削減)。
+            w_gu = mx.stack(
+                [e["gate.wq"] for e in experts] + [e["up.wq"] for e in experts]
+            )
+            s_gu = mx.stack(
+                [e["gate.s"] for e in experts] + [e["up.s"] for e in experts]
+            )
+            b_gu = mx.stack(
+                [e["gate.b"] for e in experts] + [e["up.b"] for e in experts]
+            )
+            w_gw, w_up = w_gu[:k], w_gu[k:]
+            s_gw, s_up = s_gu[:k], s_gu[k:]
+            b_gw, b_up = b_gu[:k], b_gu[k:]
             w_dw = mx.stack([e["down.wq"] for e in experts])
             s_dw = mx.stack([e["down.s"] for e in experts])
             b_dw = mx.stack([e["down.b"] for e in experts])
@@ -270,25 +301,20 @@ class StreamingMoE(nn.Module):
             out = out.at[indices].add(contrib)
         out = out.reshape(shp)
         if self._shared is not None:
-            (
-                sg_w,
-                sg_s,
-                sg_b,
-                sg_bits,
-                sg_gs,
-                se_gw,
-                se_gs,
-                se_gb,
-                se_uw,
-                se_us,
-                se_ub,
-                se_dw,
-                se_ds,
-                se_db,
-            ) = self._shared
-            sg = mx.quantized_matmul(
-                xf, sg_w, sg_s, sg_b, transpose=True, group_size=sg_gs, bits=sg_bits
-            )
+            gated = len(self._shared) == 14
+            if gated:
+                (
+                    sg_w, sg_s, sg_b, sg_bits, sg_gs,
+                    se_gw, se_gs, se_gb,
+                    se_uw, se_us, se_ub,
+                    se_dw, se_ds, se_db,
+                ) = self._shared
+            else:
+                (
+                    se_gw, se_gs, se_gb,
+                    se_uw, se_us, se_ub,
+                    se_dw, se_ds, se_db,
+                ) = self._shared
             se_g = mx.quantized_matmul(
                 xf, se_gw, se_gs, se_gb, transpose=True, group_size=GROUP, bits=BITS
             )
@@ -299,7 +325,13 @@ class StreamingMoE(nn.Module):
             se_out = mx.quantized_matmul(
                 se_h, se_dw, se_ds, se_db, transpose=True, group_size=GROUP, bits=BITS
             )
-            out = out + mx.sigmoid(sg) * se_out
+            if gated:
+                sg = mx.quantized_matmul(
+                    xf, sg_w, sg_s, sg_b, transpose=True, group_size=sg_gs, bits=sg_bits
+                )
+                out = out + mx.sigmoid(sg) * se_out
+            else:
+                out = out + se_out
         return out.astype(x.dtype)
 
 
@@ -321,6 +353,22 @@ def _read_top_k(model_path=None):
     return 8
 
 
+def _read_routing_config(model_path=None):
+    """config.json からルーティング方式を読み取る（Qwen系はsoftmax決め打ちの既定値）。
+
+    moe_router_activation_func: "softmax"(既定) または "sigmoid"（Kimi/GLM/ERNIE等）
+    routed_scaling_factor: ルーティング重みへの追加スケール（既定1.0）
+    """
+    try:
+        cfg = json.load(open(os.path.join(model_path or MODEL_PATH, "config.json")))
+        tc = cfg.get("text_config", cfg)
+        activation = tc.get("moe_router_activation_func", "softmax") or "softmax"
+        scale = tc.get("routed_scaling_factor", 1.0) or 1.0
+        return activation, float(scale)
+    except Exception:
+        return "softmax", 1.0
+
+
 def wire_streaming(model, capacity, top_k=None, perf=False, store_dir=None, model_path=None):
     """全層の mlp を StreamingMoE に差し替え、融合expertを解放。
 
@@ -330,6 +378,11 @@ def wire_streaming(model, capacity, top_k=None, perf=False, store_dir=None, mode
     """
     if top_k is None:
         top_k = _read_top_k(model_path)
+    activation, routing_scale = _read_routing_config(model_path)
+    if activation not in ("softmax", "sigmoid"):
+        raise ValueError(
+            f"未対応のmoe_router_activation_func: {activation!r}（softmax/sigmoidのみ対応）"
+        )
     store = ExpertStore(store_dir or STORE_DIR)
     if perf:
         eff_cap = max(capacity, 8000)
@@ -345,12 +398,22 @@ def wire_streaming(model, capacity, top_k=None, perf=False, store_dir=None, mode
             f"  省メモリモード: 実効容量 {s['capacity']}（{s['capacity'] * 1.69 / 1000:.1f}GB）"
         )
     layers = getattr(model, "layers", None) or model.model.layers
+    n_dense = 0
     for l, layer in enumerate(layers):
         mlp = layer.mlp
+        if not hasattr(mlp, "switch_mlp"):
+            # first_k_dense_replace 等でdense層(MoE不使用)が混在するモデル向け。
+            # 通常のMLPのまま常駐させ、ストリーミング化はスキップする。
+            n_dense += 1
+            continue
         n_exp = mlp.switch_mlp.gate_proj.weight.shape[0]
         gate = mlp.gate
-        shared_exp = getattr(mlp, "shared_expert", None)
+        # 属性名はモデルにより単数/複数が異なる（Qwen: shared_expert, GLM/Kimi: shared_experts）
+        shared_exp = getattr(mlp, "shared_expert", None) or getattr(
+            mlp, "shared_experts", None
+        )
         shared_gate = getattr(mlp, "shared_expert_gate", None)
+        correction_bias = getattr(mlp, "e_score_correction_bias", None)
         layer.mlp = StreamingMoE(
             l,
             gate,
@@ -360,7 +423,12 @@ def wire_streaming(model, capacity, top_k=None, perf=False, store_dir=None, mode
             cache,
             shared_exp=shared_exp,
             shared_gate=shared_gate,
+            activation=activation,
+            correction_bias=correction_bias,
+            routing_scale=routing_scale,
         )
+    if n_dense:
+        print(f"  dense層{n_dense}個はストリーミング対象外のまま常駐（通常のMLP）")
     mx.clear_cache()
     return cache, store
 

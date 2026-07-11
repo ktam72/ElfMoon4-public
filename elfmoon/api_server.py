@@ -31,6 +31,7 @@ Claude Code から使う場合 (~/.clauderc.json):
 """
 
 import json
+import logging
 import os
 import sys
 import time
@@ -38,6 +39,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 from threading import Lock
+
+# 一部モデルのカスタムtokenizer実装が動作に無関係なWARNINGログを出すため抑制する
+# （例: Kimi-Linearの tokenization_kimi.py が encode() 呼び出しごとに警告ログを出す）。
+logging.disable(logging.WARNING)
+
 import mlx.core as mx
 from mlx_lm import load as _mlx_load
 from mlx_lm.generate import generate_step
@@ -57,17 +63,34 @@ NO_THINK = "--no-think" in sys.argv
 
 
 class ThinkStripper:
-    """<think> ブロックをストリームから除去する（リクエスト毎に生成すること）。"""
+    """<think> ブロックをストリームから除去する（リクエスト毎に生成すること）。
+
+    enable_thinking=False をモデルが尊重する場合 <think> タグ自体が生成されない
+    ため、先頭数文字だけ覗いて "<think" で始まらなければ即座に素通しする
+    （</think> を待ち続けてストリーム終了までバッファし続ける事故を防ぐ）。
+    """
+
+    _PEEK = len("<think>")
 
     def __init__(self):
         self._buf = ""
         self._skip = True
+        self._peeking = True
 
     def feed(self, piece):
         """テキスト断片を処理。出力すべきテキストか None（保留中）を返す。"""
         if not self._skip:
             return piece
         self._buf += piece
+        if self._peeking:
+            if len(self._buf) < self._PEEK and "<think>".startswith(self._buf):
+                return None  # 判定に十分な文字数がまだない
+            self._peeking = False
+            if not self._buf.lstrip().startswith("<think"):
+                # think を生成しないモデル/モード → 即素通し
+                self._skip = False
+                out, self._buf = self._buf, ""
+                return out if out else None
         idx = self._buf.find("</think>")
         if idx >= 0:
             self._skip = False
@@ -155,12 +178,18 @@ class APIHandler(BaseHTTPRequestHandler):
 
         try:
             prompt = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=not NO_THINK,
             )
             # 生成プロンプト（<|im_start|>assistant<think> 等）を除いた安定境界。
             # マルチターンの延長プロンプトはこの境界までが共通prefixになる。
             prompt_nogen = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=False, tokenize=False
+                messages,
+                add_generation_prompt=False,
+                tokenize=False,
+                enable_thinking=not NO_THINK,
             )
         except Exception as e:
             return self._send_json(
