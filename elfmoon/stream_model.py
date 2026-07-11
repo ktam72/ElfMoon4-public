@@ -14,15 +14,47 @@ from resident_cache import ResidentCache
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# 環境変数でモデル切替。未設定時は現行のシンボリックリンク先（後方互換）
-MODEL_PATH = os.environ.get(
-    "ELFMOON_MODEL_DIR",
-    os.path.join(_HERE, "..", "models", "qwen3.6-35b-mlx"),
+DEFAULT_MODEL_NAME = "qwen3.6-35b-mlx"
+
+# モデル置き場のルート。任意ディレクトリ（外部SSD等）を指せる唯一の結合点。
+MODELS_ROOT = os.environ.get(
+    "ELFMOON_MODELS_ROOT", os.path.join(_HERE, "..", "models")
 )
-STORE_DIR = os.environ.get(
-    "ELFMOON_STORE_DIR",
-    os.path.join(_HERE, "spike/real_store"),
-)
+
+
+def resolve_model(name=None):
+    """モデル名 → (model_path, store_dir) を解決する。
+
+    store はモデルディレクトリ直下の `store/` に必ず存在する規約（integrate.py が作る）。
+    ELFMOON_MODEL_DIR/ELFMOON_STORE_DIR が明示されていれば旧方式として最優先する。
+    """
+    explicit_model = os.environ.get("ELFMOON_MODEL_DIR")
+    if name is None and explicit_model:
+        model_path = explicit_model
+        store_dir = os.environ.get("ELFMOON_STORE_DIR", os.path.join(model_path, "store"))
+        return model_path, store_dir
+
+    name = name or os.environ.get("ELFMOON_MODEL", DEFAULT_MODEL_NAME)
+    model_path = os.path.join(MODELS_ROOT, name)
+    store_dir = os.path.join(model_path, "store")
+    return model_path, store_dir
+
+
+def list_models():
+    """MODELS_ROOT 直下で config.json を持つディレクトリをモデルとして列挙する。"""
+    if not os.path.isdir(MODELS_ROOT):
+        return []
+    names = []
+    for entry in sorted(os.listdir(MODELS_ROOT)):
+        d = os.path.join(MODELS_ROOT, entry)
+        if os.path.isfile(os.path.join(d, "config.json")):
+            has_store = os.path.isdir(os.path.join(d, "store"))
+            names.append((entry, has_store))
+    return names
+
+
+# 後方互換: モジュールレベル定数（--model 未指定・env var 未設定時は既定モデル）
+MODEL_PATH, STORE_DIR = resolve_model()
 
 
 # ---- A: Compiled MoE decode ----
@@ -274,12 +306,12 @@ class StreamingMoE(nn.Module):
 # ---- Wiring ----
 
 
-def _read_top_k():
+def _read_top_k(model_path=None):
     """config.json から num_experts_per_tok を読み取る。
     35B は text_config 入れ子、80B はフラット。両方対応。
     """
     try:
-        cfg = json.load(open(os.path.join(MODEL_PATH, "config.json")))
+        cfg = json.load(open(os.path.join(model_path or MODEL_PATH, "config.json")))
         for key in ("num_experts_per_tok",):
             v = cfg.get(key) or cfg.get("text_config", {}).get(key)
             if v is not None:
@@ -289,15 +321,16 @@ def _read_top_k():
     return 8
 
 
-def wire_streaming(model, capacity, top_k=None, perf=False):
+def wire_streaming(model, capacity, top_k=None, perf=False, store_dir=None, model_path=None):
     """全層の mlp を StreamingMoE に差し替え、融合expertを解放。
 
     top_k=None の場合、config.json の num_experts_per_tok を自動検出。
     perf=True の場合、実効容量を 8000（≈13.5GB）に引き上げ。
+    store_dir/model_path 未指定時はモジュール既定（resolve_model()の結果）を使う。
     """
     if top_k is None:
-        top_k = _read_top_k()
-    store = ExpertStore(STORE_DIR)
+        top_k = _read_top_k(model_path)
+    store = ExpertStore(store_dir or STORE_DIR)
     if perf:
         eff_cap = max(capacity, 8000)
         cache = ResidentCache(eff_cap)

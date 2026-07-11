@@ -7,10 +7,13 @@ GET  /v1/models
 OpenAI 互換 API をサポートする全ツールから ElfMoon を使える。
 
 使い方:
-    python3 api_server.py [port] [resident_capacity] [--no-think]
+    python3 api_server.py [port] [resident_capacity] [--model NAME] [--no-think]
+    python3 api_server.py --list                      # 利用可能なモデル一覧
 
-    デフォルト: port=11434, capacity=6144, バインド先=127.0.0.1
+    デフォルト: port=11434, capacity=6144, バインド先=127.0.0.1, model=ELFMOON_MODEL(既定qwen3.6-35b-mlx)
     （LAN に公開する場合のみ ELFMOON_HOST=0.0.0.0 を指定。認証は無いので注意）
+    モデル置き場は ELFMOON_MODELS_ROOT で指定（既定 ../models）。各モデルは
+    <ELFMOON_MODELS_ROOT>/<name>/ に元重み一式 + integrate.py が作る store/ を持つ。
 
     curl http://localhost:11434/v1/chat/completions \\
       -d '{"model":"qwen3.6-35b","messages":[{"role":"user","content":"SwiftでFizzBuzzを書いて"}],"stream":true}'
@@ -39,7 +42,7 @@ import mlx.core as mx
 from mlx_lm import load as _mlx_load
 from mlx_lm.generate import generate_step
 from mlx_lm.sample_utils import make_sampler
-from stream_model import wire_streaming, MODEL_PATH
+from stream_model import wire_streaming, resolve_model, list_models, MODELS_ROOT
 from kv_manager import kv_manager
 from mlx_lm.models.cache import make_prompt_cache
 
@@ -47,7 +50,7 @@ from mlx_lm.models.cache import make_prompt_cache
 HOST = os.environ.get("ELFMOON_HOST", "127.0.0.1")
 DEFAULT_PORT = 11434
 DEFAULT_CAPACITY = 6144
-MODEL_ID = "qwen3.6-35b"
+MODEL_ID = "elfmoon"  # main() で実際のモデル名に上書きされる
 MAX_TOKENS = 8192
 TEMP = 0.6
 NO_THINK = "--no-think" in sys.argv
@@ -454,13 +457,35 @@ class APIHandler(BaseHTTPRequestHandler):
 def main():
     import os
 
-    perf = "--perf" in sys.argv or os.environ.get("ELFMOON_PERF") == "1"
-    args = [a for a in sys.argv[1:] if a not in ("--no-think", "--perf")]
+    argv = sys.argv[1:]
+
+    if "--list" in argv:
+        models = list_models()
+        print(f"利用可能なモデル（ELFMOON_MODELS_ROOT={MODELS_ROOT}）:")
+        for name, has_store in models:
+            print(f"  {name}" + ("" if has_store else "  ⚠️ store/ 未生成（integrate.py split_all が必要）"))
+        if not models:
+            print("  (見つかりません)")
+        return
+
+    perf = "--perf" in argv or os.environ.get("ELFMOON_PERF") == "1"
+    model_name = None
+    if "--model" in argv:
+        idx = argv.index("--model")
+        model_name = argv[idx + 1]
+        argv = argv[:idx] + argv[idx + 2 :]
+    args = [a for a in argv if a not in ("--no-think", "--perf")]
     port = int(args[0]) if len(args) > 0 else DEFAULT_PORT
     cap = int(args[1]) if len(args) > 1 else DEFAULT_CAPACITY
 
+    model_path, store_dir = resolve_model(model_name)
+
+    global MODEL_ID
+    MODEL_ID = model_name or os.path.basename(model_path)
+
     mode = "性能" if perf else "省メモリ"
     global model, tokenizer, cache
+    print(f"モデル: {model_path}", flush=True)
     print(
         f"モデルをロード中...（{mode}モード, capacity={cap}）",
         flush=True,
@@ -468,8 +493,8 @@ def main():
     t0 = time.perf_counter()
     # Load model with tokenizer using PreTrainedTokenizerFast for Qwen3.6 compat
     _tok_cfg = {"tokenizer_class": "PreTrainedTokenizerFast", "add_prefix_space": False}
-    model, tokenizer = _mlx_load(MODEL_PATH, tokenizer_config=_tok_cfg, lazy=True)
-    cache, _ = wire_streaming(model, cap, perf=perf)
+    model, tokenizer = _mlx_load(model_path, tokenizer_config=_tok_cfg, lazy=True)
+    cache, _ = wire_streaming(model, cap, perf=perf, store_dir=store_dir, model_path=model_path)
     print(f"準備完了（{time.perf_counter() - t0:.0f}秒）", flush=True)
 
     print(f"", flush=True)

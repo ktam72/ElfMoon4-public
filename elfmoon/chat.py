@@ -5,17 +5,18 @@
 
 使い方:
     cd elfmoon
-    python3 chat.py                  # 常駐 6144 (既定)
-    python3 chat.py 1200             # 省メモリ
-    python3 chat.py --no-think       # 思考プロセスを非表示
-    python3 chat.py 1200 --no-think  # 組合せ
+    python3 chat.py                       # 常駐 6144 (既定モデル)
+    python3 chat.py --model 80b           # ELFMOON_MODELS_ROOT/80b を使用
+    python3 chat.py --model 80b 1200      # モデル指定 + 省メモリ
+    python3 chat.py --no-think            # 思考プロセスを非表示
+    python3 chat.py --list                # 利用可能なモデル一覧
 """
 
 import sys
 import time
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
-from stream_model import wire_streaming, MODEL_PATH
+from stream_model import wire_streaming, resolve_model, list_models, MODELS_ROOT
 
 SYSTEM = "You are an expert coding assistant. Write clean, correct, concise code."
 MAX_TOKENS = 8192
@@ -59,16 +60,34 @@ def _strip_think(text_iter, no_think):
 
 def main():
     argv = sys.argv[1:]
+
+    if "--list" in argv:
+        models = list_models()
+        print(f"利用可能なモデル（ELFMOON_MODELS_ROOT={MODELS_ROOT}）:")
+        for name, has_store in models:
+            print(f"  {name}" + ("" if has_store else "  ⚠️ store/ 未生成（integrate.py split_all が必要）"))
+        if not models:
+            print("  (見つかりません)")
+        return
+
     no_think = "--no-think" in argv
     perf = "--perf" in argv
+    model_name = None
+    if "--model" in argv:
+        idx = argv.index("--model")
+        model_name = argv[idx + 1]
+        argv = argv[:idx] + argv[idx + 2 :]
     cap_strs = [a for a in argv if a not in ("--no-think", "--perf")]
     cap = int(cap_strs[0]) if cap_strs else 6144
 
+    model_path, store_dir = resolve_model(model_name)
+
     mode = "性能" if perf else "省メモリ"
+    print(f"モデル: {model_path}")
     print(f"モデルをロード中...（{mode}モード, capacity={cap}）")
     t0 = time.perf_counter()
-    model, tok = load(MODEL_PATH, lazy=True)
-    cache, _ = wire_streaming(model, cap, perf=perf)
+    model, tok = load(model_path, lazy=True)
+    cache, _ = wire_streaming(model, cap, perf=perf, store_dir=store_dir, model_path=model_path)
     print(
         f"準備完了（{time.perf_counter() - t0:.0f}秒）。"
         f"コーディングの依頼をどうぞ。'exit' か Ctrl-D で終了。\n"
