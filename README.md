@@ -100,6 +100,36 @@ export ELFMOON_STORE_DIR=spike/real_store_80b
 python3 chat.py
 ```
 
+### Coder-Next モデル（オプション、コード特化）
+
+80B と同一トポロジ（hidden2048 / 48層 / 512expert / top_k10）のため、`stream_model.py` / `integrate.py` は無改造で動作する。
+
+```bash
+HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3-Coder-Next-4bit \
+  --local-dir ./models/qwen3-coder-next-4bit
+
+cd elfmoon
+python3 integrate.py split_all ../models/qwen3-coder-next-4bit spike/real_store_coder spike/real_gates_coder
+
+export ELFMOON_MODEL_DIR=../models/qwen3-coder-next-4bit
+export ELFMOON_STORE_DIR=spike/real_store_coder
+export ELFMOON_GATE_DIR=spike/real_gates_coder
+python3 chat.py
+```
+
+> ⚠️ 配布物の `tokenizer_config.json` は `extra_special_tokens` が list 形式で、transformers 4.57.6 は dict `{name: token}` を要求するため読み込みエラーになる。ダウンロード後、モデルディレクトリ内の `tokenizer_config.json` を以下で変換する（元ファイルは `tokenizer_config.json.orig` に退避、重み本体は無傷）:
+> ```bash
+> cd models/qwen3-coder-next-4bit
+> cp tokenizer_config.json tokenizer_config.json.orig
+> python3 -c "
+> import json
+> c = json.load(open('tokenizer_config.json'))
+> lst = c['extra_special_tokens']
+> c['extra_special_tokens'] = {t.strip('<|>').replace('/','_'): t for t in lst}
+> json.dump(c, open('tokenizer_config.json','w'), ensure_ascii=False, indent=2)
+> "
+> ```
+
 ---
 
 ## 使い方
@@ -202,6 +232,7 @@ python3 integrate.py verify ../models/qwen3.6-35b-mlx   # 分解の往復検証
 |---|---|---|---|---|
 | **[Qwen3.6-35B-A3B](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)**（推奨） | 19 GB | 10240 | ~15-25 | 思考モード対応、高速 |
 | **[Qwen3-Next-80B-A3B](https://huggingface.co/mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit)**（実験的） | 42 GB | 24576 | ~9.7 | 品質重視向け、環境変数切替 |
+| **[Qwen3-Coder-Next](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit)**（実験的） | 42 GB | 24576 | ~8-10 | コード特化、tokenizer_config.json 要変換 |
 
 ---
 

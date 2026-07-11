@@ -81,17 +81,22 @@ def split_layer(W, l, store_dir, gate_dir):
     return n_exp
 
 
-def verify_layer0(path):
-    """分解の往復が量子化を保つか検証: 保存前スライス == 保存→ロード。"""
+def verify_layer0(path, store_dir="spike/real_store", gate_dir="spike/real_gates"):
+    """分解の往復が量子化を保つか検証: 保存前スライス == 保存→ロード。
+
+    store_dir/gate_dir は呼び出し側が明示指定すること。既定値は35B本番と衝突するため
+    他モデルの検証時は必ず専用ディレクトリを渡す（衝突すると同一shapeのモデル間で
+    サイレントに上書き破損する）。
+    """
     from expert_store import ExpertStore, expert_ffn
 
     W = load_shards(path)
-    store_dir, gate_dir = "spike/real_store", "spike/real_gates"
     PREFIX[0] = _detect_prefix(W)  # split_layer が参照する prefix を設定
     n = split_layer(W, 0, store_dir, gate_dir)
     store = ExpertStore(store_dir)
     base = f"{_base(0)}.switch_mlp"
-    x = mx.random.normal((1, 2048))
+    hidden = router_gate_float(W, 0).shape[-1]
+    x = mx.random.normal((1, hidden))
     max_err = 0.0
     for e in (0, 7, 63, 127):
         # 直接（融合テンソルからスライス）した参照
@@ -118,7 +123,7 @@ if __name__ == "__main__":
     store_dir = sys.argv[3] if len(sys.argv) > 3 else "spike/real_store"
     gate_dir = sys.argv[4] if len(sys.argv) > 4 else "spike/real_gates"
     if cmd == "verify":
-        verify_layer0(path)
+        verify_layer0(path, store_dir, gate_dir)
     elif cmd == "split_all":
         W = load_shards(path)
         PREFIX[0] = _detect_prefix(W)
