@@ -262,12 +262,11 @@ rm -rf ~/.cache/elfmoon/kv_cache
 ```bash
 cd elfmoon
 python3 verify_stream.py          # StreamingMoE と元モデルの一致検証（ELFMOON_MODEL で対象切替）
-python3 test_moe.py               # MoE ブロックのテスト
 python3 test_kv_manager.py        # KV Cache 永続化のテスト
-python3 integrate.py verify $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx   # 分解の往復検証（store_dirは常に専用の一時ディレクトリを指定すること）
+python3 integrate.py verify $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx /tmp/elfmoon_verify_test   # 分解の往復検証
 ```
 
-> ⚠️ `integrate.py verify` は第3引数の `store_dir` を省略するとモデル直下の `store/` に書き込む。**本番稼働中のモデルに対して verify を実行すると store/ を上書きしうる**ので、他モデルの検証時は必ず `spike/_verify_test` 等の使い捨てディレクトリを明示指定し、確認後に削除すること。
+`integrate.py verify` は `store_dir`（第3引数）が必須。検証用の使い捨てディレクトリ（例: `/tmp/elfmoon_verify_test`）を明示的に指定し、確認後に削除する。既定値を持たせていないのは、過去に固定パスの既定値が原因で別モデルの本番 store を誤って上書きした事故があったため（`--model` で複数モデルを切り替える運用と相性が悪い）。
 
 ---
 

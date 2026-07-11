@@ -71,8 +71,12 @@ def split_layer(W, l, store_dir):
     return n_exp
 
 
-def verify_layer0(path, store_dir="spike/real_store"):
-    """分解の往復が量子化を保つか検証: 保存前スライス == 保存→ロード。"""
+def verify_layer0(path, store_dir):
+    """分解の往復が量子化を保つか検証: 保存前スライス == 保存→ロード。
+
+    store_dir は必須（デフォルト値を持たせない）。過去に危険なデフォルト値
+    （他モデルのstoreを指す固定パス）が原因で本番storeを誤って上書きした事故があるため。
+    """
     from expert_store import ExpertStore, expert_ffn
 
     W = load_shards(path)
