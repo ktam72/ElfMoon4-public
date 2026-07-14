@@ -8,21 +8,17 @@
 
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mlx.core as mx
-from mlx_lm import load, stream_generate
-
-from stream_model import MODEL_PATH, STORE_DIR
 from expert_store import ExpertStore
+from mlx_lm import load, stream_generate
 from resident_cache import ResidentCache
+from stream_model import MODEL_PATH, STORE_DIR
 
 LONG_PROMPT = (
-    "\n".join(
-        f"func f{i}(_ x: Int) -> Int {{ return x * {i} + {i * i} }}" for i in range(40)
-    )
+    "\n".join(f"func f{i}(_ x: Int) -> Int {{ return x * {i} + {i * i} }}" for i in range(40))
     + "\n// Swiftで最大公約数gcd(_:_:)を書いて。コードのみ。"
 )
 
@@ -80,15 +76,11 @@ def run_capacity(capacity, label):
     # warmup
     mx.clear_cache()
     out, warm_tps, warm_s, warm_peak = _run_once(model, tok, store, cache, capacity)
-    print(
-        f"  warmup:  {warm_tps:.1f} t/s  hit={warm_s['hit_rate'] * 100:.1f}%  peak={warm_peak:.2f}GB"
-    )
+    print(f"  warmup:  {warm_tps:.1f} t/s  hit={warm_s['hit_rate'] * 100:.1f}%  peak={warm_peak:.2f}GB")
 
     # measured (second run, page cache hot)
     out, tps, s, peak = _run_once(model, tok, store, cache, capacity)
-    print(
-        f"  measured: {tps:.1f} t/s  hit={s['hit_rate'] * 100:.1f}%  peak={peak:.2f}GB"
-    )
+    print(f"  measured: {tps:.1f} t/s  hit={s['hit_rate'] * 100:.1f}%  peak={peak:.2f}GB")
     print(f"  出力先頭: {out[:150]}")
 
     del model, tok
@@ -108,9 +100,7 @@ if __name__ == "__main__":
     cap = int(sys.argv[1]) if len(sys.argv) > 1 else 6144
     r = run_capacity(cap, "")
     print("\n--- 結果 ---")
-    print(
-        f"{'Capacity':>10s} {'decode t/s':>11s} {'hit%':>6s} {'peak GB':>8s} {'hits':>8s} {'misses':>8s}"
-    )
+    print(f"{'Capacity':>10s} {'decode t/s':>11s} {'hit%':>6s} {'peak GB':>8s} {'hits':>8s} {'misses':>8s}")
     print("-" * 52)
     print(
         f"{r['capacity']:>10d} {r['decode_tps']:>11.1f} {r['hit_rate'] * 100:>5.1f}%"

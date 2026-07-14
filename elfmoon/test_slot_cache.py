@@ -29,9 +29,7 @@ def test_eviction_weight_integrity():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = ExpertStore(tmpdir, dim=DIM, inter=INTER)
         store.generate_synthetic(N_LAYERS, N_EXPERTS, seed=42)
-        cache = SlotResidentCache(
-            CAPACITY, store, n_layers=N_LAYERS, min_per_layer=PER_LAYER
-        )
+        cache = SlotResidentCache(CAPACITY, store, n_layers=N_LAYERS, min_per_layer=PER_LAYER)
 
         # 全 expert をアクセス → 退避を強制（per_layer=6 < N_EXPERTS=16）
         for layer in range(N_LAYERS):
@@ -60,19 +58,10 @@ def test_eviction_weight_integrity():
                     ]
                 }
                 for key in ref:
-                    err = float(
-                        mx.max(
-                            mx.abs(
-                                ref[key].astype(mx.float32)
-                                - cached[key].astype(mx.float32)
-                            )
-                        )
-                    )
+                    err = float(mx.max(mx.abs(ref[key].astype(mx.float32) - cached[key].astype(mx.float32))))
                     # bf16 保存との精度差を許容（合成データは fp32 だがバッファは bf16）
                     if err > 0.02:
-                        print(
-                            f"  layer={layer} expert={expert} key={key} 誤差={err:.2e}"
-                        )
+                        print(f"  layer={layer} expert={expert} key={key} 誤差={err:.2e}")
                     max_err = max(max_err, err)
 
         ok = max_err < 0.02  # bf16 精度範囲を許容
@@ -85,9 +74,7 @@ def test_lru_order():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = ExpertStore(tmpdir, dim=DIM, inter=INTER)
         store.generate_synthetic(N_LAYERS, N_EXPERTS, seed=42)
-        cache = SlotResidentCache(
-            CAPACITY, store, n_layers=N_LAYERS, min_per_layer=PER_LAYER
-        )
+        cache = SlotResidentCache(CAPACITY, store, n_layers=N_LAYERS, min_per_layer=PER_LAYER)
 
         layer = 0
         # PER_LAYER 個ロード → 全スロット占有
@@ -109,14 +96,7 @@ def test_lru_order():
         # 重み一致確認（uint32 は完全一致）
         ref = store.load(layer, 0)
         slot = slots[0]
-        err = float(
-            mx.max(
-                mx.abs(
-                    ref["gate.wq"].astype(mx.float32)
-                    - cache.gate_wq[layer][slot].astype(mx.float32)
-                )
-            )
-        )
+        err = float(mx.max(mx.abs(ref["gate.wq"].astype(mx.float32) - cache.gate_wq[layer][slot].astype(mx.float32))))
         assert err == 0, f"再ロード後の gate.wq 誤差: {err:.2e}"
         # bf16 のスケール/バイアスも許容誤差内
         for key in ["gate.s", "gate.b"]:
@@ -124,9 +104,7 @@ def test_lru_order():
                 mx.max(
                     mx.abs(
                         ref[key].astype(mx.float32)
-                        - getattr(cache, key.replace(".", "_"))[layer][slot].astype(
-                            mx.float32
-                        )
+                        - getattr(cache, key.replace(".", "_"))[layer][slot].astype(mx.float32)
                     )
                 )
             )
@@ -139,9 +117,7 @@ def test_in_use_guard():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = ExpertStore(tmpdir, dim=DIM, inter=INTER)
         store.generate_synthetic(N_LAYERS, N_EXPERTS, seed=42)
-        cache = SlotResidentCache(
-            CAPACITY, store, n_layers=N_LAYERS, min_per_layer=PER_LAYER
-        )
+        cache = SlotResidentCache(CAPACITY, store, n_layers=N_LAYERS, min_per_layer=PER_LAYER)
 
         layer = 0
         # 全スロット占有
@@ -159,10 +135,7 @@ def test_in_use_guard():
         slot_of_0_in_result = slots[0]
         err = float(
             mx.max(
-                mx.abs(
-                    ref["gate.wq"].astype(mx.float32)
-                    - cache.gate_wq[layer][slot_of_0_in_result].astype(mx.float32)
-                )
+                mx.abs(ref["gate.wq"].astype(mx.float32) - cache.gate_wq[layer][slot_of_0_in_result].astype(mx.float32))
             )
         )
         assert err == 0, f"in_use 保護後の gate.wq 誤差: {err:.2e}"
@@ -171,9 +144,7 @@ def test_in_use_guard():
                 mx.max(
                     mx.abs(
                         ref[key].astype(mx.float32)
-                        - getattr(cache, key.replace(".", "_"))[layer][
-                            slot_of_0_in_result
-                        ].astype(mx.float32)
+                        - getattr(cache, key.replace(".", "_"))[layer][slot_of_0_in_result].astype(mx.float32)
                     )
                 )
             )
@@ -186,9 +157,7 @@ def test_prime_eviction():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = ExpertStore(tmpdir, dim=DIM, inter=INTER)
         store.generate_synthetic(N_LAYERS, N_EXPERTS, seed=42)
-        cache = SlotResidentCache(
-            CAPACITY, store, n_layers=N_LAYERS, min_per_layer=PER_LAYER
-        )
+        cache = SlotResidentCache(CAPACITY, store, n_layers=N_LAYERS, min_per_layer=PER_LAYER)
 
         layer = 0
         # 全スロット占有
@@ -204,23 +173,14 @@ def test_prime_eviction():
         # 重み一致確認
         ref = store.load(layer, PER_LAYER)
         slot = cache._lru[key]
-        err = float(
-            mx.max(
-                mx.abs(
-                    ref["gate.wq"].astype(mx.float32)
-                    - cache.gate_wq[layer][slot].astype(mx.float32)
-                )
-            )
-        )
+        err = float(mx.max(mx.abs(ref["gate.wq"].astype(mx.float32) - cache.gate_wq[layer][slot].astype(mx.float32))))
         assert err == 0, f"prime 後の gate.wq 誤差: {err:.2e}"
         for key in ["gate.s", "gate.b"]:
             err = float(
                 mx.max(
                     mx.abs(
                         ref[key].astype(mx.float32)
-                        - getattr(cache, key.replace(".", "_"))[layer][slot].astype(
-                            mx.float32
-                        )
+                        - getattr(cache, key.replace(".", "_"))[layer][slot].astype(mx.float32)
                     )
                 )
             )
@@ -233,9 +193,7 @@ def test_evict_runtime_error():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = ExpertStore(tmpdir, dim=DIM, inter=INTER)
         store.generate_synthetic(N_LAYERS, N_EXPERTS, seed=42)
-        cache = SlotResidentCache(
-            CAPACITY, store, n_layers=N_LAYERS, min_per_layer=PER_LAYER
-        )
+        cache = SlotResidentCache(CAPACITY, store, n_layers=N_LAYERS, min_per_layer=PER_LAYER)
 
         layer = 0
         # 全スロット占有

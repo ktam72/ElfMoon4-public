@@ -8,8 +8,7 @@ import time
 
 import mlx.core as mx
 import mlx.nn as nn
-
-from expert_store import ExpertStore, GROUP, BITS
+from expert_store import BITS, GROUP, ExpertStore
 from resident_cache import ResidentCache
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -17,9 +16,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_NAME = "qwen3.6-35b-mlx"
 
 # モデル置き場のルート。任意ディレクトリ（外部SSD等）を指せる唯一の結合点。
-MODELS_ROOT = os.environ.get(
-    "ELFMOON_MODELS_ROOT", os.path.join(_HERE, "..", "models")
-)
+MODELS_ROOT = os.environ.get("ELFMOON_MODELS_ROOT", os.path.join(_HERE, "..", "models"))
 
 
 def resolve_model(name=None):
@@ -31,7 +28,9 @@ def resolve_model(name=None):
     explicit_model = os.environ.get("ELFMOON_MODEL_DIR")
     if name is None and explicit_model:
         model_path = explicit_model
-        store_dir = os.environ.get("ELFMOON_STORE_DIR", os.path.join(model_path, "store"))
+        store_dir = os.environ.get(
+            "ELFMOON_STORE_DIR", os.path.join(model_path, "store")
+        )
         return model_path, store_dir
 
     name = name or os.environ.get("ELFMOON_MODEL", DEFAULT_MODEL_NAME)
@@ -63,12 +62,9 @@ MODEL_PATH, STORE_DIR = resolve_model()
 @mx.compile
 def _decode_moe(
     x: mx.array,
-    w_gw: mx.array,
-    s_gw: mx.array,
-    b_gw: mx.array,
-    w_up: mx.array,
-    s_up: mx.array,
-    b_up: mx.array,
+    w_gu: mx.array,
+    s_gu: mx.array,
+    b_gu: mx.array,
     w_dw: mx.array,
     s_dw: mx.array,
     b_dw: mx.array,
@@ -76,39 +72,45 @@ def _decode_moe(
     top_k: int,
     shared=None,
 ):
-    xb = mx.broadcast_to(x, (top_k, 1, x.shape[-1]))
-    g = mx.quantized_matmul(
-        xb, w_gw, s_gw, b_gw, transpose=True, group_size=GROUP, bits=BITS
+    xb = mx.broadcast_to(x, (2 * top_k, 1, x.shape[-1]))
+    gu = mx.quantized_matmul(
+        xb, w_gu, s_gu, b_gu, transpose=True, group_size=GROUP, bits=BITS
     )
-    u = mx.quantized_matmul(
-        xb, w_up, s_up, b_up, transpose=True, group_size=GROUP, bits=BITS
-    )
+    g, u = gu[:top_k], gu[top_k:]
     h = (g * mx.sigmoid(g)) * u
     yo = mx.quantized_matmul(
         h, w_dw, s_dw, b_dw, transpose=True, group_size=GROUP, bits=BITS
     )
     result = (yo[:, 0, :] * weights[:, None]).sum(0)
     if shared is not None:
-        gated = len(shared) == 14
+        gated = len(shared) == 11
         if gated:
             (
-                sg_w, sg_s, sg_b, sg_bits, sg_gs,
-                se_gw, se_gs, se_gb,
-                se_uw, se_us, se_ub,
-                se_dw, se_ds, se_db,
+                sg_w,
+                sg_s,
+                sg_b,
+                sg_bits,
+                sg_gs,
+                se_guw,
+                se_gus,
+                se_gub,
+                se_dw,
+                se_ds,
+                se_db,
             ) = shared
         else:
             (
-                se_gw, se_gs, se_gb,
-                se_uw, se_us, se_ub,
-                se_dw, se_ds, se_db,
+                se_guw,
+                se_gus,
+                se_gub,
+                se_dw,
+                se_ds,
+                se_db,
             ) = shared
-        se_g = mx.quantized_matmul(
-            x, se_gw, se_gs, se_gb, transpose=True, group_size=GROUP, bits=BITS
+        se_gu = mx.quantized_matmul(
+            x, se_guw, se_gus, se_gub, transpose=True, group_size=GROUP, bits=BITS
         )
-        se_u = mx.quantized_matmul(
-            x, se_uw, se_us, se_ub, transpose=True, group_size=GROUP, bits=BITS
-        )
+        se_g, se_u = se_gu[:, : se_gu.shape[-1] // 2], se_gu[:, se_gu.shape[-1] // 2 :]
         se_h = (se_g * mx.sigmoid(se_g)) * se_u
         se_out = mx.quantized_matmul(
             se_h, se_dw, se_ds, se_db, transpose=True, group_size=GROUP, bits=BITS
@@ -158,19 +160,19 @@ class StreamingMoE(nn.Module):
 
         if shared_exp is not None:
             se = shared_exp
+            # gate+up の量子化重みを結合して1回の quantized_matmul に統合する
+            se_gu_w = mx.concatenate([se.gate_proj.weight, se.up_proj.weight], axis=0)
+            se_gu_s = mx.concatenate([se.gate_proj.scales, se.up_proj.scales], axis=0)
+            se_gu_b = mx.concatenate([se.gate_proj.biases, se.up_proj.biases], axis=0)
             se_tuple = (
-                se.gate_proj.weight,
-                se.gate_proj.scales,
-                se.gate_proj.biases,
-                se.up_proj.weight,
-                se.up_proj.scales,
-                se.up_proj.biases,
+                se_gu_w,
+                se_gu_s,
+                se_gu_b,
                 se.down_proj.weight,
                 se.down_proj.scales,
                 se.down_proj.biases,
             )
             if shared_gate is not None:
-                # Qwen方式: shared_expert出力に sigmoid(gate(x)) を乗じる
                 sg = shared_gate
                 self._shared = (
                     sg.weight,
@@ -180,7 +182,6 @@ class StreamingMoE(nn.Module):
                     sg.group_size,
                 ) + se_tuple
             else:
-                # GLM/Kimi方式: ゲートなし、shared_expert出力をそのまま加算
                 self._shared = se_tuple
         else:
             self._shared = None
@@ -188,20 +189,23 @@ class StreamingMoE(nn.Module):
     def __call__(self, x):
         shp = x.shape
         xf = x.reshape(-1, shp[-1])
-        logits = self.gate(xf).astype(mx.float32)
+        logits = self.gate(xf)
         if self.activation == "sigmoid":
             probs = mx.sigmoid(logits)
         else:
             probs = mx.softmax(logits, axis=-1)
         # 選択(top-k)には補正バイアス込みのスコアを使うが、重みには補正前の
         # probs を使う（DeepSeek/Kimi式 aux-loss-free ルーティングの規約）。
-        sel_probs = probs + self.correction_bias if self.correction_bias is not None else probs
+        sel_probs = (
+            probs + self.correction_bias if self.correction_bias is not None else probs
+        )
         idx = mx.argpartition(-sel_probs, self.top_k - 1, axis=-1)[:, : self.top_k]
         w = mx.take_along_axis(probs, idx, axis=-1)
         if self.norm:
             w = w / mx.sum(w, axis=-1, keepdims=True)
         if self.routing_scale != 1.0:
             w = w * self.routing_scale
+        mx.eval(idx, w)
         idx_l = idx.tolist()
         N = xf.shape[0]
 
@@ -212,10 +216,7 @@ class StreamingMoE(nn.Module):
 
         if N == 1:
             experts = [load(e) for e in idx_l[0]]
-            k = len(experts)
 
-            # gate/up は同shape(dim→moe_inter)なので1回のstackにまとめ、
-            # down(moe_inter→dim)だけ別stackにする(9回→6回の mx.stack でカーネル起動を削減)。
             w_gu = mx.stack(
                 [e["gate.wq"] for e in experts] + [e["up.wq"] for e in experts]
             )
@@ -225,9 +226,6 @@ class StreamingMoE(nn.Module):
             b_gu = mx.stack(
                 [e["gate.b"] for e in experts] + [e["up.b"] for e in experts]
             )
-            w_gw, w_up = w_gu[:k], w_gu[k:]
-            s_gw, s_up = s_gu[:k], s_gu[k:]
-            b_gw, b_up = b_gu[:k], b_gu[k:]
             w_dw = mx.stack([e["down.wq"] for e in experts])
             s_dw = mx.stack([e["down.s"] for e in experts])
             b_dw = mx.stack([e["down.b"] for e in experts])
@@ -235,12 +233,9 @@ class StreamingMoE(nn.Module):
             weights = w[0].astype(mx.float16)
             result = _decode_moe(
                 xf[0:1],
-                w_gw,
-                s_gw,
-                b_gw,
-                w_up,
-                s_up,
-                b_up,
+                w_gu,
+                s_gu,
+                b_gu,
                 w_dw,
                 s_dw,
                 b_dw,
@@ -301,29 +296,45 @@ class StreamingMoE(nn.Module):
             out = out.at[indices].add(contrib)
         out = out.reshape(shp)
         if self._shared is not None:
-            gated = len(self._shared) == 14
+            gated = len(self._shared) == 11
             if gated:
                 (
-                    sg_w, sg_s, sg_b, sg_bits, sg_gs,
-                    se_gw, se_gs, se_gb,
-                    se_uw, se_us, se_ub,
-                    se_dw, se_ds, se_db,
+                    sg_w,
+                    sg_s,
+                    sg_b,
+                    sg_bits,
+                    sg_gs,
+                    se_gu_w,
+                    se_gu_s,
+                    se_gu_b,
+                    se_dw,
+                    se_ds,
+                    se_db,
                 ) = self._shared
             else:
                 (
-                    se_gw, se_gs, se_gb,
-                    se_uw, se_us, se_ub,
-                    se_dw, se_ds, se_db,
+                    se_gu_w,
+                    se_gu_s,
+                    se_gu_b,
+                    se_dw,
+                    se_ds,
+                    se_db,
                 ) = self._shared
-            se_g = mx.quantized_matmul(
-                xf, se_gw, se_gs, se_gb, transpose=True, group_size=GROUP, bits=BITS
+            se_h = mx.quantized_matmul(
+                xf,
+                se_gu_w,
+                se_gu_s,
+                se_gu_b,
+                transpose=True,
+                group_size=GROUP,
+                bits=BITS,
             )
-            se_u = mx.quantized_matmul(
-                xf, se_uw, se_us, se_ub, transpose=True, group_size=GROUP, bits=BITS
-            )
-            se_h = (se_g * mx.sigmoid(se_g)) * se_u
+            k2 = se_h.shape[-1] // 2
+            se_g, se_u = se_h[..., :k2], se_h[..., k2:]
+            se_gated = se_g * mx.sigmoid(se_g)
+            se_act = se_gated * se_u
             se_out = mx.quantized_matmul(
-                se_h, se_dw, se_ds, se_db, transpose=True, group_size=GROUP, bits=BITS
+                se_act, se_dw, se_ds, se_db, transpose=True, group_size=GROUP, bits=BITS
             )
             if gated:
                 sg = mx.quantized_matmul(
@@ -369,7 +380,9 @@ def _read_routing_config(model_path=None):
         return "softmax", 1.0
 
 
-def wire_streaming(model, capacity, top_k=None, perf=False, store_dir=None, model_path=None):
+def wire_streaming(
+    model, capacity, top_k=None, perf=False, store_dir=None, model_path=None
+):
     """全層の mlp を StreamingMoE に差し替え、融合expertを解放。
 
     top_k=None の場合、config.json の num_experts_per_tok を自動検出。
@@ -437,7 +450,8 @@ def wire_streaming(model, capacity, top_k=None, perf=False, store_dir=None, mode
 
 if __name__ == "__main__":
     import sys
-    from mlx_lm import load, generate
+
+    from mlx_lm import generate, load
 
     cap = int(sys.argv[1]) if len(sys.argv) > 1 else 6144
     perf = "--perf" in sys.argv

@@ -35,23 +35,22 @@ import logging
 import os
 import sys
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
-from urllib.parse import urlparse
 from threading import Lock
+from urllib.parse import urlparse
 
 # 一部モデルのカスタムtokenizer実装が動作に無関係なWARNINGログを出すため抑制する
 # （例: Kimi-Linearの tokenization_kimi.py が encode() 呼び出しごとに警告ログを出す）。
 logging.disable(logging.WARNING)
 
 import mlx.core as mx
+from kv_manager import kv_manager
 from mlx_lm import load as _mlx_load
 from mlx_lm.generate import generate_step
-from mlx_lm.sample_utils import make_sampler
-from stream_model import wire_streaming, resolve_model, list_models, MODELS_ROOT
-from kv_manager import kv_manager
 from mlx_lm.models.cache import make_prompt_cache
-
+from mlx_lm.sample_utils import make_sampler
+from stream_model import MODELS_ROOT, list_models, resolve_model, wire_streaming
 
 HOST = os.environ.get("ELFMOON_HOST", "127.0.0.1")
 DEFAULT_PORT = 11434
@@ -169,9 +168,7 @@ class APIHandler(BaseHTTPRequestHandler):
         )
 
         if not messages:
-            return self._send_json(
-                400, {"error": "invalid_request", "message": "messages is required"}
-            )
+            return self._send_json(400, {"error": "invalid_request", "message": "messages is required"})
 
         max_tokens = min(body.get("max_tokens", MAX_TOKENS), MAX_TOKENS)
         temperature = body.get("temperature", TEMP)
@@ -271,8 +268,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 _prefill(prompt_ids[cached_len : len(prompt_ids) - 1])
             if len(prompt_ids) - 1 > cached_len:
                 print(
-                    f"[KVC] prefill done in {time.time() - prefill_t:.1f}s"
-                    f" (boundary={boundary})",
+                    f"[KVC] prefill done in {time.time() - prefill_t:.1f}s (boundary={boundary})",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -281,9 +277,7 @@ class APIHandler(BaseHTTPRequestHandler):
             sampler = make_sampler(temp=temperature)
             detokenizer = tokenizer.detokenizer
             detokenizer.reset()
-            eos_ids = getattr(tokenizer, "eos_token_ids", None) or {
-                tokenizer.eos_token_id
-            }
+            eos_ids = getattr(tokenizer, "eos_token_ids", None) or {tokenizer.eos_token_id}
             stripper = ThinkStripper() if NO_THINK else None
             n = 0
 
@@ -361,9 +355,7 @@ class APIHandler(BaseHTTPRequestHandler):
         error = False
 
         try:
-            for piece, n in self._generate_cached(
-                prompt, prompt_nogen, max_tokens, temperature
-            ):
+            for piece, n in self._generate_cached(prompt, prompt_nogen, max_tokens, temperature):
                 chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -381,9 +373,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 total = n
         except Exception as e:
             error = True
-            print(
-                f"[API] stream error at token {total}: {e}", file=sys.stderr, flush=True
-            )
+            print(f"[API] stream error at token {total}: {e}", file=sys.stderr, flush=True)
             err_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -410,8 +400,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self._sse(json.dumps(final, ensure_ascii=False))
         self._sse("[DONE]")
         print(
-            f"[API] stream done: {total} tokens in {dt:.1f}s ({total / dt:.1f} t/s)"
-            f" error={error}",
+            f"[API] stream done: {total} tokens in {dt:.1f}s ({total / dt:.1f} t/s) error={error}",
             file=sys.stderr,
             flush=True,
         )
@@ -421,16 +410,12 @@ class APIHandler(BaseHTTPRequestHandler):
         pieces = []
         total = 0
         try:
-            for piece, n in self._generate_cached(
-                prompt, prompt_nogen, max_tokens, temperature
-            ):
+            for piece, n in self._generate_cached(prompt, prompt_nogen, max_tokens, temperature):
                 pieces.append(piece)
                 total = n
         except Exception as e:
             print(f"[API] generate error: {e}", file=sys.stderr, flush=True)
-            return self._send_json(
-                500, {"error": "generation_error", "message": str(e)}
-            )
+            return self._send_json(500, {"error": "generation_error", "message": str(e)})
         text = "".join(pieces)
         print(
             f"[API] generate done in {time.time() - t0:.3f}s",
@@ -476,7 +461,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _sse(self, data):
-        self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+        self.wfile.write(f"data: {data}\n\n".encode())
         self.wfile.flush()
 
     def log_message(self, fmt, *args):
@@ -526,28 +511,28 @@ def main():
     cache, _ = wire_streaming(model, cap, perf=perf, store_dir=store_dir, model_path=model_path)
     print(f"準備完了（{time.perf_counter() - t0:.0f}秒）", flush=True)
 
-    print(f"", flush=True)
+    print("", flush=True)
     print(f"  ElfMoon API サーバ起動: http://{HOST}:{port}", flush=True)
     if HOST == "127.0.0.1":
         print(
-            f"  （LAN公開する場合: ELFMOON_HOST=0.0.0.0 で起動。認証なし注意）",
+            "  （LAN公開する場合: ELFMOON_HOST=0.0.0.0 で起動。認証なし注意）",
             flush=True,
         )
-    print(f"  POST /v1/chat/completions  (OpenAI 互換, stream/non-stream)", flush=True)
-    print(f"  GET  /v1/models", flush=True)
-    print(f"", flush=True)
-    print(f"  Claude Code 設定例 (~/.clauderc.json または claude.json):", flush=True)
-    print(f'    {{"models":[{{"name":"elfmoon","provider":"openai",', flush=True)
+    print("  POST /v1/chat/completions  (OpenAI 互換, stream/non-stream)", flush=True)
+    print("  GET  /v1/models", flush=True)
+    print("", flush=True)
+    print("  Claude Code 設定例 (~/.clauderc.json または claude.json):", flush=True)
+    print('    {"models":[{"name":"elfmoon","provider":"openai",', flush=True)
     print(f'      "model":"{MODEL_ID}","apiKey":"sk-not-needed",', flush=True)
     print(f'      "baseUrl":"http://localhost:{port}/v1"}}]}}', flush=True)
-    print(f"", flush=True)
-    print(f"  VS Code Continue 設定例 (~/.continue/config.json):", flush=True)
-    print(f'    {{"models":[{{"title":"ElfMoon","provider":"openai",', flush=True)
+    print("", flush=True)
+    print("  VS Code Continue 設定例 (~/.continue/config.json):", flush=True)
+    print('    {"models":[{"title":"ElfMoon","provider":"openai",', flush=True)
     print(
         f'      "model":"{MODEL_ID}","apiBase":"http://localhost:{port}/v1"}}]}}',
         flush=True,
     )
-    print(f"  Ctrl-C で終了", flush=True)
+    print("  Ctrl-C で終了", flush=True)
 
     server = ThreadingHTTPServer((HOST, port), APIHandler)
     try:

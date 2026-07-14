@@ -4,11 +4,11 @@
 DS4 の ds4_ssd_auto_cache_plan（予算×4/5、非routed差引、expert数算出）に対応。
 命中率がElfMoonの速度を決める中核指標なので hit/miss を記録する。
 """
+
 from collections import OrderedDict
 
 
-def plan_cache_experts(budget_bytes, non_expert_bytes, per_expert_bytes,
-                       max_experts=None, headroom=0.8):
+def plan_cache_experts(budget_bytes, non_expert_bytes, per_expert_bytes, max_experts=None, headroom=0.8):
     """常駐予算からホットexpert数を算出（DS4方式）。"""
     target = int(budget_bytes * headroom)
     cache_bytes = max(0, target - non_expert_bytes)
@@ -62,6 +62,10 @@ class ResidentCache:
         return self.hits / t if t else 0.0
 
     def stats(self):
-        return {"hits": self.hits, "misses": self.misses,
-                "hit_rate": self.hit_rate, "resident": len(self._d),
-                "capacity": self.capacity}
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": self.hit_rate,
+            "resident": len(self._d),
+            "capacity": self.capacity,
+        }

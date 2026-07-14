@@ -12,11 +12,11 @@ import time
 from collections import Counter
 
 import mlx.core as mx
+from expert_store import BITS, GROUP, ExpertStore
 from mlx_lm import load
 from mlx_lm.generate import generate_step
-from stream_model import StreamingMoE, MODEL_PATH, STORE_DIR, _decode_moe
-from expert_store import ExpertStore, GROUP, BITS
 from resident_cache import ResidentCache
+from stream_model import MODEL_PATH, STORE_DIR, StreamingMoE, _decode_moe
 
 LONG_PROMPT = (
     "\n".join(
@@ -39,7 +39,7 @@ def _make_logging_call():
     def logging_call(self, x):
         shp = x.shape
         xf = x.reshape(-1, shp[-1])
-        logits = self.gate(xf).astype(mx.float32)
+        logits = self.gate(xf)
         probs = mx.softmax(logits, axis=-1)
         idx = mx.argpartition(-probs, self.top_k - 1, axis=-1)[:, : self.top_k]
         w = mx.take_along_axis(probs, idx, axis=-1)
@@ -58,12 +58,15 @@ def _make_logging_call():
             EXPERT_LOG.append((self.layer_idx, idx_l[0]))
             experts = [load(e) for e in idx_l[0]]
 
-            w_gw = mx.stack([e["gate.wq"] for e in experts])
-            s_gw = mx.stack([e["gate.s"] for e in experts])
-            b_gw = mx.stack([e["gate.b"] for e in experts])
-            w_up = mx.stack([e["up.wq"] for e in experts])
-            s_up = mx.stack([e["up.s"] for e in experts])
-            b_up = mx.stack([e["up.b"] for e in experts])
+            w_gu = mx.stack(
+                [e["gate.wq"] for e in experts] + [e["up.wq"] for e in experts]
+            )
+            s_gu = mx.stack(
+                [e["gate.s"] for e in experts] + [e["up.s"] for e in experts]
+            )
+            b_gu = mx.stack(
+                [e["gate.b"] for e in experts] + [e["up.b"] for e in experts]
+            )
             w_dw = mx.stack([e["down.wq"] for e in experts])
             s_dw = mx.stack([e["down.s"] for e in experts])
             b_dw = mx.stack([e["down.b"] for e in experts])
@@ -71,12 +74,9 @@ def _make_logging_call():
             weights = w[0].astype(mx.float16)
             result = _decode_moe(
                 xf[0:1],
-                w_gw,
-                s_gw,
-                b_gw,
-                w_up,
-                s_up,
-                b_up,
+                w_gu,
+                s_gu,
+                b_gu,
                 w_dw,
                 s_dw,
                 b_dw,
@@ -255,7 +255,7 @@ def main():
         pair_agreements.append(sum(layer_scores) / len(layer_scores))
 
     avg_agree = sum(pair_agreements) / len(pair_agreements) if pair_agreements else 0
-    print(f"\n=== 連続トークン一致率 ===")
+    print("\n=== 連続トークン一致率 ===")
     print(f"  全体平均: {avg_agree * 100:.1f}%")
 
     per_layer_agree = [0.0] * n_layers
@@ -332,12 +332,12 @@ def main():
             total_churn += 8 - len(prev_set & curr_set)
             total_pairs += 1
     avg_churn = total_churn / total_pairs if total_pairs else 0
-    print(f"\n=== 入れ替わり ===")
+    print("\n=== 入れ替わり ===")
     print(f"  平均 churn / 層: {avg_churn:.2f} / 8")
 
     # ---- 5. 出力確認 ----
     out = tok.decode(gen_tokens)
-    print(f"\n--- 出力先頭200字 ---")
+    print("\n--- 出力先頭200字 ---")
     print(out[:200] if out else "(empty)")
 
     # 復元

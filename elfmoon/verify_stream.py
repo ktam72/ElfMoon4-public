@@ -5,11 +5,14 @@
 対象モデルは ELFMOON_MODEL（既定 qwen3.6-35b-mlx）/ ELFMOON_MODELS_ROOT で指定。
 """
 
-import json, os, mlx.core as mx
-from mlx_lm import load
-from stream_model import StreamingMoE, MODEL_PATH, STORE_DIR
+import json
+import os
+
+import mlx.core as mx
 from expert_store import ExpertStore
+from mlx_lm import load
 from resident_cache import ResidentCache
+from stream_model import MODEL_PATH, STORE_DIR, StreamingMoE
 
 model, tok = load(MODEL_PATH, lazy=True)
 # config.json から top_k を自動検出（未指定時は8＝35B互換）
@@ -41,7 +44,4 @@ for l in sorted({0, 1, n_layers // 2, n_layers - 1}):
     ym = mine(x)
     err = float(mx.max(mx.abs(yo.astype(mx.float32) - ym.astype(mx.float32))))
     rel = err / (float(mx.max(mx.abs(yo.astype(mx.float32)))) + 1e-9)
-    print(
-        f"layer {l:2d}: 最大誤差={err:.4e} 相対={rel:.4e} "
-        f"{'OK' if rel < 1e-2 else 'NG(ずれ)'}"
-    )
+    print(f"layer {l:2d}: 最大誤差={err:.4e} 相対={rel:.4e} {'OK' if rel < 1e-2 else 'NG(ずれ)'}")

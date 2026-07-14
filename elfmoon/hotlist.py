@@ -7,7 +7,9 @@ DS4 の ds4_streaming_hotlist.inc（hits/weight順の静的リスト）に対応
 真の層先読みプリフェッチ（層Lの計算中に層L+1のexpertをSSDから先読み）は
 毎層routerが前層出力に依存する逐次性があるため後段で扱う。まずは最も効く静的プライム。
 """
+
 from collections import Counter
+
 import mlx.core as mx
 from moe_block import route
 
@@ -34,7 +36,7 @@ def build_hotlist(counter):
 def prime_cache(cache, store, hotlist, max_experts):
     """ホットリスト上位を起動時にキャッシュへ常駐（命中/ミス統計を汚さない）。"""
     n = 0
-    for (l, e) in hotlist[:max_experts]:
+    for l, e in hotlist[:max_experts]:
         cache.prime((l, e), store.load(l, e))
         n += 1
     mx.eval()

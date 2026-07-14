@@ -22,7 +22,7 @@ logging.disable(logging.WARNING)
 
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
-from stream_model import wire_streaming, resolve_model, list_models, MODELS_ROOT
+from stream_model import MODELS_ROOT, list_models, resolve_model, wire_streaming
 
 SYSTEM = "You are an expert coding assistant. Write clean, correct, concise code."
 MAX_TOKENS = 8192
@@ -102,10 +102,7 @@ def main():
     t0 = time.perf_counter()
     model, tok = load(model_path, lazy=True)
     cache, _ = wire_streaming(model, cap, perf=perf, store_dir=store_dir, model_path=model_path)
-    print(
-        f"準備完了（{time.perf_counter() - t0:.0f}秒）。"
-        f"コーディングの依頼をどうぞ。'exit' か Ctrl-D で終了。\n"
-    )
+    print(f"準備完了（{time.perf_counter() - t0:.0f}秒）。コーディングの依頼をどうぞ。'exit' か Ctrl-D で終了。\n")
 
     messages = [{"role": "system", "content": SYSTEM}]
     while True:
@@ -158,12 +155,8 @@ def main():
             # 生成失敗を黙殺しない（途中で切れた応答を正常完了に見せない）
             print(f"\n\033[1;31m[エラー] 生成が中断されました: {e}\033[0m")
 
-        elapsed = (
-            (time.perf_counter() - answer_t) if answer_t else (time.perf_counter() - t)
-        )
-        print(
-            f"\n\033[2m（{n} tokens, {n / elapsed:.1f} tok/s, 命中率{cache.hit_rate * 100:.0f}%）\033[0m"
-        )
+        elapsed = (time.perf_counter() - answer_t) if answer_t else (time.perf_counter() - t)
+        print(f"\n\033[2m（{n} tokens, {n / elapsed:.1f} tok/s, 命中率{cache.hit_rate * 100:.0f}%）\033[0m")
         messages.append({"role": "assistant", "content": resp})
 
 

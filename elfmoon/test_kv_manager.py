@@ -11,9 +11,8 @@ import tempfile
 import time
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, ArraysCache
-
-from kv_manager import KVCacheManager, MIN_SAVE_TOKENS
+from kv_manager import MIN_SAVE_TOKENS, KVCacheManager
+from mlx_lm.models.cache import ArraysCache, KVCache
 
 
 class FakeModel:
@@ -67,9 +66,7 @@ def test_roundtrip_and_immutability(tmp):
     mx.eval(exp_k, exp_arr0)
 
     # --- 生成をシミュレート: KV追記 + 再帰状態の上書き ---
-    cache[0].update_and_fetch(
-        mx.ones((1, 2, 5, 4), dtype=mx.float16), mx.ones((1, 2, 5, 4), dtype=mx.float16)
-    )
+    cache[0].update_and_fetch(mx.ones((1, 2, 5, 4), dtype=mx.float16), mx.ones((1, 2, 5, 4), dtype=mx.float16))
     cache[1].state = [mx.zeros((1, 3)), mx.zeros((1, 2))]
 
     mgr.save(tokens, snap)

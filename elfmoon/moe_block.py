@@ -5,7 +5,9 @@
 ホット=キャッシュ命中（将来は融合バッチ計算）、コールド=ストアから個別ロード。
 v1 は正しさ優先で per-expert ループ（k=8程度なので実害小）。
 """
+
 import mlx.core as mx
+
 try:
     from .expert_store import expert_ffn
 except ImportError:
@@ -14,7 +16,7 @@ except ImportError:
 
 def route(x, gate_w, top_k, norm=True):
     """x:[dim], gate_w:[n_experts, dim] → (idx[top_k], weight[top_k])。"""
-    logits = gate_w @ x                      # [n_experts]
+    logits = gate_w @ x  # [n_experts]
     probs = mx.softmax(logits, axis=-1)
     idx = mx.argpartition(-probs, top_k - 1)[:top_k]
     w = probs[idx]
@@ -36,11 +38,10 @@ class MoEBlock:
         """x:[dim] → y:[dim]。"""
         idx, w = route(x, self.gate_w, self.top_k)
         idx = [int(i) for i in idx.tolist()]
-        xr = x[None]                          # [1, dim]
+        xr = x[None]  # [1, dim]
         y = mx.zeros_like(x)
         for e, weight in zip(idx, w):
-            wt = self.cache.get((self.layer, e),
-                                lambda e=e: self.store.load(self.layer, e))
+            wt = self.cache.get((self.layer, e), lambda e=e: self.store.load(self.layer, e))
             y = y + weight * expert_ffn(xr, wt)[0]
         return y
 

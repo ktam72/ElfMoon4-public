@@ -7,7 +7,10 @@
 量子化パラメータ: expert=group64/bit4（ExpertStoreと一致→スライスのみ）, gate=group64/bit8。
 """
 
-import sys, os, json
+import json
+import os
+import sys
+
 import mlx.core as mx
 
 GROUP = 64
@@ -117,11 +120,7 @@ if __name__ == "__main__":
         PREFIX[0] = _detect_prefix(W)
         pfx = PREFIX[0]
         print(f"検出: prefix={pfx!r}, ", end="", flush=True)
-        n_layers = 1 + max(
-            int(k.split(".layers.")[1].split(".")[0])
-            for k in W
-            if f"{pfx}.layers." in k
-        )
+        n_layers = 1 + max(int(k.split(".layers.")[1].split(".")[0]) for k in W if f"{pfx}.layers." in k)
         print(f"layers={n_layers}", flush=True)
         n_dense = 0
         for l in range(n_layers):

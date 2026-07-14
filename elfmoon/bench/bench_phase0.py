@@ -10,16 +10,13 @@ C案 HANDOFF_DECODE_SPEEDUP_C.md §2 に基づく。
   - 報告: gen tokens-per-sec（デコード単体）、命中率、ピークメモリ、品質先頭200字
 """
 
-import os
-import sys
 import time
 
 import mlx.core as mx
-from mlx_lm import load, generate
-
-from stream_model import StreamingMoE, MODEL_PATH, STORE_DIR, _decode_moe
-from expert_store import ExpertStore, GROUP, BITS
+from expert_store import BITS, GROUP, ExpertStore
+from mlx_lm import generate, load
 from resident_cache import ResidentCache
+from stream_model import MODEL_PATH, STORE_DIR, StreamingMoE, _decode_moe
 
 LONG_PROMPT = (
     "\n".join(
@@ -81,8 +78,7 @@ def _run_once(store, cache, patch_fn=None):
     gen_tokens = len(tok.encode(out)) if out.strip() else 0
     gen_speed = gen_tokens / dt if dt > 0 and gen_tokens > 0 else 0.0
     print(
-        f"    warmup: gen={gen_speed:.1f} t/s ({gen_tokens}t)  "
-        f"hit={s['hit_rate'] * 100:.1f}%  peak={peak:.1f}GB"
+        f"    warmup: gen={gen_speed:.1f} t/s ({gen_tokens}t)  hit={s['hit_rate'] * 100:.1f}%  peak={peak:.1f}GB"
     )
 
     # --- reset cache stats so measured reflects cold-start miss rate ---
@@ -99,8 +95,7 @@ def _run_once(store, cache, patch_fn=None):
     gen_tokens = len(tok.encode(out)) if out.strip() else 0
     gen_speed = gen_tokens / dt if dt > 0 and gen_tokens > 0 else 0.0
     print(
-        f"    measured: gen={gen_speed:.1f} t/s ({gen_tokens}t)  "
-        f"hit={s['hit_rate'] * 100:.1f}%  peak={peak:.1f}GB"
+        f"    measured: gen={gen_speed:.1f} t/s ({gen_tokens}t)  hit={s['hit_rate'] * 100:.1f}%  peak={peak:.1f}GB"
     )
 
     result = {
@@ -142,24 +137,18 @@ def _patch_fixed_experts():
                     (self.layer_idx, e), lambda e=e: self._store.load(self.layer_idx, e)
                 )
                 bufs.append(w)
-            w_gw = mx.stack([b["gate.wq"] for b in bufs])
-            s_gw = mx.stack([b["gate.s"] for b in bufs])
-            b_gw = mx.stack([b["gate.b"] for b in bufs])
-            w_up = mx.stack([b["up.wq"] for b in bufs])
-            s_up = mx.stack([b["up.s"] for b in bufs])
-            b_up = mx.stack([b["up.b"] for b in bufs])
+            w_gu = mx.stack([b["gate.wq"] for b in bufs] + [b["up.wq"] for b in bufs])
+            s_gu = mx.stack([b["gate.s"] for b in bufs] + [b["up.s"] for b in bufs])
+            b_gu = mx.stack([b["gate.b"] for b in bufs] + [b["up.b"] for b in bufs])
             w_dw = mx.stack([b["down.wq"] for b in bufs])
             s_dw = mx.stack([b["down.s"] for b in bufs])
             b_dw = mx.stack([b["down.b"] for b in bufs])
             weights = mx.array([1.0 / TOP_K] * TOP_K, dtype=mx.float16)
             result = _decode_moe(
                 xf[0:1],
-                w_gw,
-                s_gw,
-                b_gw,
-                w_up,
-                s_up,
-                b_up,
+                w_gu,
+                s_gu,
+                b_gu,
                 w_dw,
                 s_dw,
                 b_dw,
@@ -182,7 +171,7 @@ def _patch_tolist_discard():
         xf = x.reshape(-1, shp[-1])
         N = xf.shape[0]
         if N == 1:
-            logits = self.gate(xf).astype(mx.float32)
+            logits = self.gate(xf)
             probs = mx.softmax(logits, axis=-1)
             idx = mx.argpartition(-probs, self.top_k - 1, axis=-1)[:, : self.top_k]
             _ = idx.tolist()
@@ -192,24 +181,18 @@ def _patch_tolist_discard():
                     (self.layer_idx, e), lambda e=e: self._store.load(self.layer_idx, e)
                 )
                 bufs.append(w)
-            w_gw = mx.stack([b["gate.wq"] for b in bufs])
-            s_gw = mx.stack([b["gate.s"] for b in bufs])
-            b_gw = mx.stack([b["gate.b"] for b in bufs])
-            w_up = mx.stack([b["up.wq"] for b in bufs])
-            s_up = mx.stack([b["up.s"] for b in bufs])
-            b_up = mx.stack([b["up.b"] for b in bufs])
+            w_gu = mx.stack([b["gate.wq"] for b in bufs] + [b["up.wq"] for b in bufs])
+            s_gu = mx.stack([b["gate.s"] for b in bufs] + [b["up.s"] for b in bufs])
+            b_gu = mx.stack([b["gate.b"] for b in bufs] + [b["up.b"] for b in bufs])
             w_dw = mx.stack([b["down.wq"] for b in bufs])
             s_dw = mx.stack([b["down.s"] for b in bufs])
             b_dw = mx.stack([b["down.b"] for b in bufs])
             weights = mx.array([1.0 / TOP_K] * TOP_K, dtype=mx.float16)
             result = _decode_moe(
                 xf[0:1],
-                w_gw,
-                s_gw,
-                b_gw,
-                w_up,
-                s_up,
-                b_up,
+                w_gu,
+                s_gu,
+                b_gu,
                 w_dw,
                 s_dw,
                 b_dw,

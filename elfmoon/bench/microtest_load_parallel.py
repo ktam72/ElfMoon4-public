@@ -4,10 +4,9 @@
 所要時間を比較する。並列が逐次より明確に速ければ C-1a に進む。
 """
 
-import os
-import sys
-import time
 import concurrent.futures
+import os
+import time
 
 import mlx.core as mx
 
@@ -130,9 +129,7 @@ def main():
     print(f"  平均(並列コールド): {avg_cold_par * 1000:.2f}ms\n")
 
     print("=== 総評 ===")
-    print(
-        f"  ウォーム 逐次/並列: {avg_seq * 1000:.1f}ms / {avg_par * 1000:.1f}ms ({avg_seq / avg_par:.2f}x)"
-    )
+    print(f"  ウォーム 逐次/並列: {avg_seq * 1000:.1f}ms / {avg_par * 1000:.1f}ms ({avg_seq / avg_par:.2f}x)")
     print(
         f"  コールド 逐次/並列: {avg_cold * 1000:.1f}ms / {avg_cold_par * 1000:.1f}ms ({avg_cold / avg_cold_par:.2f}x)"
     )

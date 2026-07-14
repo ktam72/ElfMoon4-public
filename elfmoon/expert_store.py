@@ -4,7 +4,9 @@
 mmap経由で必要な1個だけを高速ロードできるようにする。
 これが「コールドexpertをSSDからストリーム」する土台。
 """
+
 import os
+
 import mlx.core as mx
 
 # Qwen3-Coder-30B-A3B 近似の既定形状
@@ -68,10 +70,7 @@ class ExpertStore:
 
 def expert_ffn(x, w):
     """SwiGLU FFN を量子化重みで計算。x:[T, dim] → [T, dim]。"""
-    g = mx.quantized_matmul(x, w["gate.wq"], w["gate.s"], w["gate.b"],
-                            transpose=True, group_size=GROUP, bits=BITS)
-    u = mx.quantized_matmul(x, w["up.wq"], w["up.s"], w["up.b"],
-                            transpose=True, group_size=GROUP, bits=BITS)
+    g = mx.quantized_matmul(x, w["gate.wq"], w["gate.s"], w["gate.b"], transpose=True, group_size=GROUP, bits=BITS)
+    u = mx.quantized_matmul(x, w["up.wq"], w["up.s"], w["up.b"], transpose=True, group_size=GROUP, bits=BITS)
     h = (g * mx.sigmoid(g)) * u
-    return mx.quantized_matmul(h, w["down.wq"], w["down.s"], w["down.b"],
-                              transpose=True, group_size=GROUP, bits=BITS)
+    return mx.quantized_matmul(h, w["down.wq"], w["down.s"], w["down.b"], transpose=True, group_size=GROUP, bits=BITS)

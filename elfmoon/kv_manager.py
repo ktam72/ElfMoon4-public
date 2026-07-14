@@ -22,10 +22,10 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, ArraysCache
+from mlx_lm.models.cache import ArraysCache, KVCache
 
 DISK_CACHE_DIR = os.path.expanduser("~/.cache/elfmoon/kv_cache")
 MAX_DISK_ENTRIES = 4
@@ -33,11 +33,9 @@ MIN_SAVE_TOKENS = 20
 FORMAT_VERSION = 2
 
 
-def _build_cache_objects(
-    offset: int, layer_data: List[Tuple[str, Any]], n_layers: int
-) -> List[Any]:
+def _build_cache_objects(offset: int, layer_data: list[tuple[str, Any]], n_layers: int) -> list[Any]:
     """保存データからキャッシュオブジェクトを再構築する。"""
-    cache: List[Any] = []
+    cache: list[Any] = []
     for tag, data in layer_data:
         if tag == "kv":
             keys, vals = data
@@ -69,13 +67,13 @@ class KVCacheManager:
 
     # ---- hash ----
 
-    def _hash_prefix(self, tokens: List[int], length: int) -> str:
+    def _hash_prefix(self, tokens: list[int], length: int) -> str:
         packed = b"".join(struct.pack("<i", t) for t in tokens[:length])
         return hashlib.sha256(packed).hexdigest()
 
     # ---- snapshot ----
 
-    def snapshot(self, cache: List[Any]) -> Optional[List[Tuple[str, Any]]]:
+    def snapshot(self, cache: list[Any]) -> list[tuple[str, Any]] | None:
         """prefill 直後のキャッシュ状態を捕捉する（save() で永続化する）。
 
         MLX 配列への添字代入は新しいバッキングを生成するため、ArraysCache の
@@ -84,7 +82,7 @@ class KVCacheManager:
         save() 時に offset までスライスすれば捕捉時点の内容が得られる。
         非対応のキャッシュ型や未初期化の再帰状態がある場合は None（保存不可）。
         """
-        snap: List[Tuple[str, Any]] = []
+        snap: list[tuple[str, Any]] = []
         for c in cache:
             if isinstance(c, KVCache):
                 snap.append(("kv", (c.keys, c.values, c.offset)))
@@ -100,12 +98,12 @@ class KVCacheManager:
 
     # ---- lookup（メモリ→ディスク、最長プレフィックス一致） ----
 
-    def lookup(self, prompt_ids: List[int], model) -> Tuple[Optional[List[Any]], int]:
+    def lookup(self, prompt_ids: list[int], model) -> tuple[list[Any] | None, int]:
         n_layers = len(getattr(model, "layers", None) or model.model.layers)
 
         # 1) メモリ: 一致する中で最長 offset のエントリ
         best_key = None
-        best: Optional[Tuple[int, Any]] = None
+        best: tuple[int, Any] | None = None
         for key, (offset, layer_data) in self._caches.items():
             if (
                 offset <= len(prompt_ids)
@@ -121,8 +119,7 @@ class KVCacheManager:
         candidates = [
             e
             for e in self._list_disk_entries()
-            if e.get("offset", 0) <= len(prompt_ids)
-            and self._hash_prefix(prompt_ids, e["offset"]) == e.get("hash", "")
+            if e.get("offset", 0) <= len(prompt_ids) and self._hash_prefix(prompt_ids, e["offset"]) == e.get("hash", "")
         ]
         candidates.sort(key=lambda e: e["offset"], reverse=True)
         for entry in candidates:
@@ -152,7 +149,7 @@ class KVCacheManager:
 
     # ---- save（メモリ＋ディスク） ----
 
-    def save(self, token_ids: List[int], snap: Optional[List[Tuple[str, Any]]]):
+    def save(self, token_ids: list[int], snap: list[tuple[str, Any]] | None):
         """snapshot() の捕捉状態を token_ids（処理済み全トークン）キーで保存する。"""
         if snap is None:
             return
@@ -165,8 +162,8 @@ class KVCacheManager:
             self._caches.move_to_end(key)
             return
 
-        layer_data: List[Tuple[str, Any]] = []
-        to_eval: List[mx.array] = []
+        layer_data: list[tuple[str, Any]] = []
+        to_eval: list[mx.array] = []
         for tag, data in snap:
             if tag == "kv":
                 keys, vals, kv_off = data
@@ -209,14 +206,14 @@ class KVCacheManager:
         self,
         key: str,
         offset: int,
-        layer_data: List[Tuple[str, Any]],
+        layer_data: list[tuple[str, Any]],
         prompt_length: int,
     ):
         try:
             with self._disk_lock:
-                arrays: Dict[str, mx.array] = {}
-                kv_indices: List[int] = []
-                arr_indices: Dict[str, int] = {}
+                arrays: dict[str, mx.array] = {}
+                kv_indices: list[int] = []
+                arr_indices: dict[str, int] = {}
                 for i, (tag, data) in enumerate(layer_data):
                     if tag == "kv":
                         k, v = data
@@ -255,7 +252,7 @@ class KVCacheManager:
         except Exception as e:
             print(f"[KVC] disk save error: {e}", file=sys.stderr, flush=True)
 
-    def _disk_load_arrays(self, key: str) -> List[Tuple[str, Any]]:
+    def _disk_load_arrays(self, key: str) -> list[tuple[str, Any]]:
         with open(self._meta_path(key)) as f:
             meta = json.load(f)
         if meta.get("version") != FORMAT_VERSION:
@@ -264,22 +261,20 @@ class KVCacheManager:
         kv_indices = set(meta.get("kv_indices", []))
         arr_indices = {int(k): v for k, v in meta.get("arr_indices", {}).items()}
 
-        arrays: Dict[str, mx.array] = mx.load(self._disk_path(key))  # type: ignore[assignment]
-        layer_data: List[Tuple[str, Any]] = []
+        arrays: dict[str, mx.array] = mx.load(self._disk_path(key))  # type: ignore[assignment]
+        layer_data: list[tuple[str, Any]] = []
         for i in range(num_layers):
             if i in kv_indices:
                 layer_data.append(("kv", (arrays[f"l{i}_keys"], arrays[f"l{i}_values"])))
             elif i in arr_indices:
-                layer_data.append(
-                    ("arr", [arrays[f"l{i}_arr{j}"] for j in range(arr_indices[i])])
-                )
+                layer_data.append(("arr", [arrays[f"l{i}_arr{j}"] for j in range(arr_indices[i])]))
             else:
                 layer_data.append(("arr", None))
         if all(tag == "arr" and d is None for tag, d in layer_data):
             raise ValueError(f"No cache entries found in {self._disk_path(key)}")
         return layer_data
 
-    def _list_disk_entries(self) -> List[Dict]:
+    def _list_disk_entries(self) -> list[dict]:
         if not os.path.isdir(self._dir):
             return []
         entries = []
@@ -290,7 +285,7 @@ class KVCacheManager:
                         meta = json.load(f)
                     if meta.get("version") == FORMAT_VERSION:
                         entries.append(meta)
-                except (json.JSONDecodeError, IOError):
+                except (OSError, json.JSONDecodeError):
                     pass
         return entries
 
@@ -306,7 +301,7 @@ class KVCacheManager:
                 with open(path) as f:
                     meta = json.load(f)
                 version = meta.get("version")
-            except (json.JSONDecodeError, IOError):
+            except (OSError, json.JSONDecodeError):
                 version = None
             if version != FORMAT_VERSION:
                 key = fname[: -len(".json")]

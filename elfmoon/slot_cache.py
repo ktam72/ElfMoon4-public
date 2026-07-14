@@ -7,8 +7,7 @@
 from collections import OrderedDict
 
 import mlx.core as mx
-
-from expert_store import GROUP, BITS
+from expert_store import GROUP
 
 INTER = 512
 DIM = 2048
@@ -85,10 +84,7 @@ class SlotResidentCache:
                 slot = self._lru.pop(key)
                 del self._layer_maps[l][e]
                 return slot
-        raise RuntimeError(
-            f"layer {layer}: 退避可能スロットなし"
-            f"（per_layer={self.per_layer}, in_use={len(in_use)}）"
-        )
+        raise RuntimeError(f"layer {layer}: 退避可能スロットなし（per_layer={self.per_layer}, in_use={len(in_use)}）")
 
     def get_slots(self, layer, expert_ids):
         """expert_ids (list[int]) に対応するスロット番号のリストを返す。"""
@@ -132,9 +128,7 @@ class SlotResidentCache:
         layer, expert = key
         slots = self.get_slots(layer, [expert])
         slot = slots[0]
-        return {
-            name: getattr(self, _buf_name(name))[layer][slot] for name in EXPERT_SHAPES
-        }
+        return {name: getattr(self, _buf_name(name))[layer][slot] for name in EXPERT_SHAPES}
 
     def prime(self, layer, expert):
         key = (layer, expert)
@@ -162,9 +156,7 @@ class SlotResidentCache:
         return {
             "hits": self.hits,
             "misses": self.misses,
-            "hit_rate": self.hits / (self.hits + self.misses)
-            if (self.hits + self.misses)
-            else 0.0,
+            "hit_rate": self.hits / (self.hits + self.misses) if (self.hits + self.misses) else 0.0,
             "resident": len(self._lru),
             "capacity": self.n_layers * self.per_layer,
         }
