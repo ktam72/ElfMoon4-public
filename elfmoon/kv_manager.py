@@ -312,10 +312,10 @@ class KVCacheManager:
                 continue
             path = os.path.join(self._dir, fname)
             try:
-                with open(path) as f:
+                with open(path, encoding="utf-8") as f:
                     meta = json.load(f)
                 version = meta.get("version")
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 version = None
             if version != FORMAT_VERSION:
                 key = fname[: -len(".json")]

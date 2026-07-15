@@ -33,7 +33,7 @@ from stream_model import MODELS_ROOT, list_models, resolve_model, wire_streaming
 from pathlib import Path
 
 SYSTEM = "You are an expert coding assistant. Write clean, correct, concise code."
-MAX_TOKENS = 8192
+MAX_TOKENS = 16384
 MAX_HISTORY = 8
 TEMP = 0.4
 

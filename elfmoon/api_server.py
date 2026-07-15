@@ -1,4 +1,4 @@
-"""ElfMoon OpenAI 互換 API サーバ（KV Cache 永続化対応）。
+"""ElfMoon OpenAI 互換 API サーバ（generation-thread 方式）。
 
 POST /v1/chat/completions   (stream/non-stream, OpenAI 互換)
 GET  /v1/models
@@ -38,12 +38,11 @@ from pathlib import Path
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from queue import Queue
 from socketserver import ThreadingMixIn
-from threading import Lock
+from threading import Thread, Event as ThreadEvent
 from urllib.parse import urlparse
 
-# 一部モデルのカスタムtokenizer実装が動作に無関係なWARNINGログを出すため抑制する
-# （例: Kimi-Linearの tokenization_kimi.py が encode() 呼び出しごとに警告ログを出す）。
 logging.disable(logging.WARNING)
 
 import mlx.core as mx
@@ -57,19 +56,14 @@ from stream_model import MODELS_ROOT, list_models, resolve_model, wire_streaming
 HOST = os.environ.get("ELFMOON_HOST", "127.0.0.1")
 DEFAULT_PORT = 11434
 DEFAULT_CAPACITY = 6144
-MODEL_ID = "elfmoon"  # main() で実際のモデル名に上書きされる
-MAX_TOKENS = 8192
+MODEL_ID = "elfmoon"
+MAX_TOKENS = 16384
 TEMP = 0.6
 NO_THINK = "--no-think" in sys.argv
 
 
 class ThinkStripper:
-    """<think> ブロックをストリームから除去する（リクエスト毎に生成すること）。
-
-    enable_thinking=False をモデルが尊重する場合 <think> タグ自体が生成されない
-    ため、先頭数文字だけ覗いて "<think" で始まらなければ即座に素通しする
-    （</think> を待ち続けてストリーム終了までバッファし続ける事故を防ぐ）。
-    """
+    """<think> ブロックをストリームから除去する（リクエスト毎に生成すること）。"""
 
     _PEEK = len("<think>")
 
@@ -79,16 +73,14 @@ class ThinkStripper:
         self._peeking = True
 
     def feed(self, piece):
-        """テキスト断片を処理。出力すべきテキストか None（保留中）を返す。"""
         if not self._skip:
             return piece
         self._buf += piece
         if self._peeking:
             if len(self._buf) < self._PEEK and "<think>".startswith(self._buf):
-                return None  # 判定に十分な文字数がまだない
+                return None
             self._peeking = False
             if not self._buf.lstrip().startswith("<think"):
-                # think を生成しないモデル/モード → 即素通し
                 self._skip = False
                 out, self._buf = self._buf, ""
                 return out if out else None
@@ -102,21 +94,275 @@ class ThinkStripper:
 
     @property
     def pending(self):
-        """ストリーム終了時に </think> 未出現なら溜めた分を返す（応答消失防止）。"""
         return self._buf if self._skip else ""
 
 
-model = None
-tokenizer = None
-cache = None
-# 生成リクエスト全体を直列化するロック。
-# 共有 detokenizer と MoE 常駐キャッシュを並行リクエストの混線から守る。
-model_lock = Lock()
+# ---- generation engine（専用スレッドでモデルを動かす） ----
+
+
+class GenerationEngine:
+    """モデルを専用スレッドで保持し、リクエストを直列化して generation する。
+
+    HTTP スレッドは GPU に一切触れず、Engine にリクエストを渡すだけ。
+    Engine は内部で generate_step を使い、chat.py と同一の性能を発揮する。
+    """
+
+    def __init__(self, model_path: str, store_dir: str, cap: int, perf: bool):
+        self._queue = Queue()
+        self._ready = ThreadEvent()
+        self._thread = Thread(target=self._run, daemon=True)
+        self._model_path = model_path
+        self._store_dir = store_dir
+        self._cap = cap
+        self._perf = perf
+        self._model = None
+        self._tokenizer = None
+        self._moe_cache = None
+
+        self._thread.start()
+        self._ready.wait()  # モデルロード完了を待つ
+
+    def generate(
+        self,
+        prompt: str,
+        prompt_nogen: str,
+        max_tokens: int,
+        temperature: float,
+        no_think: bool,
+    ):
+        cancel = ThreadEvent()
+        q: Queue = Queue()
+        self._queue.put(
+            (q, cancel, prompt, prompt_nogen, max_tokens, temperature, no_think)
+        )
+        prompt_tokens = None
+        try:
+            while True:
+                msg = q.get()
+                if msg is None:
+                    break
+                if isinstance(msg, Exception):
+                    raise msg
+                if isinstance(msg, int):
+                    prompt_tokens = msg
+                    continue
+                yield msg
+                if cancel.is_set():
+                    break
+        except GeneratorExit:
+            cancel.set()
+            raise
+
+    # ---- 以下、generation スレッド ---- #
+
+    def _run(self):
+        mx.eval(mx.array(0))
+        mx.new_thread_local_stream(mx.default_device())
+        self._load_model()
+        self._ready.set()
+        err_count = 0
+        while True:
+            item = self._queue.get()
+            q, cancel, prompt, prompt_nogen, max_tokens, temperature, no_think = item
+            try:
+                gen = self._generate_impl(
+                    prompt, prompt_nogen, max_tokens, temperature, no_think
+                )
+                for msg in gen:
+                    if cancel.is_set():
+                        gen.close()
+                        break
+                    q.put(msg)
+                err_count = 0
+            except Exception as e:
+                err_count += 1
+                import traceback
+
+                traceback.print_exc()
+                q.put(Exception(str(e)))
+            finally:
+                q.put(None)
+
+    def _load_model(self):
+        mp = Path(self._model_path)
+        with open(mp / "config.json") as f:
+            cfg = json.load(f)
+        model_type = cfg.get("model_type", "")
+
+        if model_type == "deepseek_v4":
+            from model_v4 import DeepseekV4Model
+            from stream_model import _wire_deepseek_v4
+
+            self._model = DeepseekV4Model(str(mp), fused_quant=True)
+            self._moe_cache, _ = _wire_deepseek_v4(
+                self._model,
+                self._cap,
+                top_k=6,
+                store_dir=self._store_dir,
+                model_path=str(mp),
+            )
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(str(mp))
+        else:
+            from mlx_lm.utils import load_model as _lm_load
+
+            self._model, _ = _lm_load(mp, lazy=True)
+            try:
+                _tok_cfg = {
+                    "tokenizer_class": "PreTrainedTokenizerFast",
+                    "add_prefix_space": False,
+                }
+                _, self._tokenizer = _mlx_load(
+                    str(mp),
+                    tokenizer_config=_tok_cfg,
+                    lazy=True,
+                )
+            except Exception:
+                from transformers import PreTrainedTokenizerFast
+                from tokenizers import Tokenizer
+
+                tk = Tokenizer.from_file(str(mp / "tokenizer.json"))
+                self._tokenizer = PreTrainedTokenizerFast(tokenizer_object=tk)
+                ct_path = mp / "chat_template.jinja"
+                if ct_path.exists():
+                    self._tokenizer.chat_template = ct_path.read_text()
+                with open(mp / "config.json") as f:
+                    _eos_cfg = json.load(f)
+                eos_ids = _eos_cfg.get("eos_token_id", [])
+                if isinstance(eos_ids, list) and eos_ids:
+                    self._tokenizer.eos_token_id = eos_ids[0]
+            if model_type != "gemma4" and os.path.isdir(os.path.join(str(mp), "store")):
+                self._moe_cache, _ = wire_streaming(
+                    self._model,
+                    self._cap,
+                    perf=self._perf,
+                    store_dir=self._store_dir,
+                    model_path=str(mp),
+                )
+            else:
+                pass  # mx.compile は現在の環境で遅くなるためスキップ
+
+    def _generate_impl(self, prompt, prompt_nogen, max_tokens, temperature, no_think):
+        tokenizer = self._tokenizer
+        model = self._model
+
+        prompt_ids = tokenizer.encode(prompt)
+        prompt_tokens = len(prompt_ids)
+        yield prompt_tokens
+
+        print(
+            f"[ENGINE] prompt={prompt_tokens}tok max_tokens={max_tokens} temp={temperature}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        nogen_ids = tokenizer.encode(prompt_nogen)
+        boundary = 0
+        for i in range(min(len(nogen_ids), len(prompt_ids))):
+            if prompt_ids[i] != nogen_ids[i]:
+                break
+            boundary = i + 1
+
+        sampler = make_sampler(temp=temperature)
+        detokenizer = tokenizer.detokenizer
+        detokenizer.reset()
+        eos_ids = getattr(tokenizer, "eos_token_ids", None) or {tokenizer.eos_token_id}
+        stripper = ThinkStripper() if no_think else None
+
+        cached_cache, cached_len = kv_manager.lookup(prompt_ids, model)
+
+        if cached_cache is not None and cached_len < len(prompt_ids):
+            prompt_cache = cached_cache
+            print(
+                f"[ENGINE] KVC hit offset={cached_len} new={len(prompt_ids) - cached_len}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            prompt_cache = make_prompt_cache(model)
+            print(
+                f"[ENGINE] KVC fresh (prompt={prompt_tokens})",
+                file=sys.stderr,
+                flush=True,
+            )
+            cached_len = 0
+
+        # 手動プリフィル: 境界（履歴終端）まで → snapshot
+        save_key_ids = None
+        snap = None
+        prefill_t = time.time()
+        if cached_len < boundary:
+            remaining = prompt_ids[cached_len:boundary]
+            step = 2048
+            for i in range(0, len(remaining), step):
+                chunk = remaining[i : i + step]
+                model(mx.array([chunk]), cache=prompt_cache)
+            snap = kv_manager.snapshot(prompt_cache)
+            save_key_ids = prompt_ids[:boundary]
+            print(
+                f"[ENGINE] KVC history prefilled: {boundary - cached_len}tok in {time.time() - prefill_t:.1f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        # generate_step に残り全部を渡す（生成プロンプトのプリフィル + 生成を一括）
+        remaining_ids = prompt_ids[boundary:]
+        if not remaining_ids:
+            remaining_ids = [tokenizer.eos_token_id]
+
+        generate_t = time.time()
+        generator = generate_step(
+            mx.array(remaining_ids),
+            model,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            prompt_cache=prompt_cache,
+        )
+        n = 0
+        try:
+            for token, _logprob in generator:
+                if token in eos_ids:
+                    break
+                detokenizer.add_token(token)
+                piece = detokenizer.last_segment
+                if not piece:
+                    continue
+                n += 1
+                if stripper is not None:
+                    piece = stripper.feed(piece)
+                    if piece is None:
+                        continue
+                yield (piece, n)
+            if stripper is not None and stripper.pending:
+                yield (stripper.pending, n)
+        except Exception as e:
+            print(f"[ENGINE] error at token {n}: {e}", file=sys.stderr, flush=True)
+            raise
+        finally:
+            print(
+                f"[ENGINE] done: {n} tokens in {time.time() - generate_t:.1f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            if save_key_ids is not None:
+                kv_manager.save(save_key_ids, snap)
+
+
+# ---- HTTP ----
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+
+engine: GenerationEngine = None
+
+
+def _get_engine():
+    global engine
+    return engine
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -168,25 +414,34 @@ class APIHandler(BaseHTTPRequestHandler):
             file=sys.stderr,
             flush=True,
         )
-
         if not messages:
             return self._send_json(
                 400, {"error": "invalid_request", "message": "messages is required"}
+            )
+        if req_id != "?" and req_id != MODEL_ID:
+            return self._send_json(
+                400,
+                {
+                    "error": "model_not_loaded",
+                    "message": (
+                        f"model='{req_id}' はロードされていません。"
+                        f"現在ロード中: {MODEL_ID}。"
+                        f" クライアント設定で model を {MODEL_ID} に修正してください。"
+                    ),
+                },
             )
 
         max_tokens = min(body.get("max_tokens", MAX_TOKENS), MAX_TOKENS)
         temperature = body.get("temperature", TEMP)
 
         try:
-            prompt = tokenizer.apply_chat_template(
+            prompt = self._tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
                 tokenize=False,
                 enable_thinking=not NO_THINK,
             )
-            # 生成プロンプト（<|im_start|>assistant<think> 等）を除いた安定境界。
-            # マルチターンの延長プロンプトはこの境界までが共通prefixになる。
-            prompt_nogen = tokenizer.apply_chat_template(
+            prompt_nogen = self._tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=False,
                 tokenize=False,
@@ -203,147 +458,9 @@ class APIHandler(BaseHTTPRequestHandler):
         else:
             self._handle_nonstream(prompt, prompt_nogen, max_tokens, temperature)
 
-    def _generate_cached(self, prompt, prompt_nogen, max_tokens, temperature):
-        """KV Cache 永続化 generation。yields (piece: str, n: int)。
-
-        model_lock をリクエスト全体で保持して直列化する（シングルユーザー前提）。
-        スナップショットは生成プロンプト末尾を除いた「安定境界」で取得する
-        （マルチターンの延長プロンプトがこの境界で prefix ヒットするため）。
-        """
-        global model, tokenizer
-
-        prompt_ids = tokenizer.encode(prompt)
-        self._prompt_tokens = len(prompt_ids)
-        print(
-            f"[API] generate prompt={len(prompt_ids)}tok max_tokens={max_tokens} temp={temperature}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-        # 安定境界 B（token単位）: 生成プロンプト末尾（<|im_start|>assistant<think> 等）を
-        # 除いた位置。トークン化が prefix 性を満たさない場合は末尾-1 に退避。
-        nogen_ids = tokenizer.encode(prompt_nogen)
-        boundary = len(nogen_ids)
-        if not (0 < boundary < len(prompt_ids) and prompt_ids[:boundary] == nogen_ids):
-            boundary = len(prompt_ids) - 1
-
-        with model_lock:
-            cached_cache, cached_len = kv_manager.lookup(prompt_ids, model)
-
-            if cached_cache is not None and cached_len < len(prompt_ids):
-                prompt_cache = cached_cache
-                print(
-                    f"[KVC] hit offset={cached_len} new_ids={len(prompt_ids) - cached_len}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            else:
-                prompt_cache = make_prompt_cache(model)
-                if cached_cache is not None:
-                    print(
-                        f"[KVC] miss (cached_len={cached_len} vs prompt={len(prompt_ids)})",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[KVC] fresh (prompt={len(prompt_ids)})",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                cached_len = 0
-
-            def _prefill(ids):
-                if ids:
-                    model(mx.array([ids]), cache=prompt_cache)
-                    mx.eval([c.state for c in prompt_cache])
-
-            prefill_t = time.time()
-            snap = None
-            save_key_ids = None
-            if cached_len <= boundary:
-                # 境界まで prefill → 整合スナップショット → 生成プロンプト部を prefill
-                _prefill(prompt_ids[cached_len:boundary])
-                snap = kv_manager.snapshot(prompt_cache)
-                save_key_ids = prompt_ids[:boundary]
-                _prefill(prompt_ids[boundary : len(prompt_ids) - 1])
-            else:
-                # 復元キャッシュが境界より長い＝同等以上の保存済みエントリあり → 保存不要
-                _prefill(prompt_ids[cached_len : len(prompt_ids) - 1])
-            if len(prompt_ids) - 1 > cached_len:
-                print(
-                    f"[KVC] prefill done in {time.time() - prefill_t:.1f}s (boundary={boundary})",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
-            start_prompt = mx.array([prompt_ids[-1]])
-            sampler = make_sampler(temp=temperature)
-            detokenizer = tokenizer.detokenizer
-            detokenizer.reset()
-            eos_ids = getattr(tokenizer, "eos_token_ids", None) or {
-                tokenizer.eos_token_id
-            }
-            stripper = ThinkStripper() if NO_THINK else None
-            n = 0
-
-            generate_t = time.time()
-            generator = generate_step(
-                start_prompt,
-                model,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                prompt_cache=prompt_cache,
-            )
-            try:
-                while True:
-                    try:
-                        token, _ = next(generator)
-                    except StopIteration:
-                        break
-                    if token in eos_ids:
-                        print(
-                            f"[API] EOS at token {n} (elapsed {time.time() - generate_t:.1f}s)",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        break
-                    try:
-                        detokenizer.add_token(token)
-                        piece = detokenizer.last_segment
-                    except Exception as detok_err:
-                        print(
-                            f"[API] detokenizer error at token {n}: {detok_err}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        continue
-                    if not piece:
-                        continue
-                    n += 1
-                    if stripper is not None:
-                        piece = stripper.feed(piece)
-                        if piece is None:
-                            continue
-                    yield piece, n
-                # </think> が最後まで現れなかった場合、溜めた分を破棄せず出力する
-                if stripper is not None and stripper.pending:
-                    yield stripper.pending, n
-            except Exception as e:
-                print(
-                    f"[API] generate error at token {n}: {e}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            finally:
-                print(
-                    f"[API] generate yield: {n} tokens in {time.time() - generate_t:.1f}s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                # 安定境界時点の整合状態を保存（キー＝先頭 boundary トークン）
-                if save_key_ids is not None:
-                    kv_manager.save(save_key_ids, snap)
+    @property
+    def _tokenizer(self):
+        return _get_engine()._tokenizer
 
     def _handle_stream(self, prompt, prompt_nogen, max_tokens, temperature):
         t0 = time.time()
@@ -358,23 +475,25 @@ class APIHandler(BaseHTTPRequestHandler):
         completion_id = f"chatcmpl-{int(time.time())}"
         created = int(time.time())
         total = 0
+        prompt_tokens = 0
         error = False
 
+        gen = _get_engine().generate(
+            prompt, prompt_nogen, max_tokens, temperature, NO_THINK
+        )
         try:
-            for piece, n in self._generate_cached(
-                prompt, prompt_nogen, max_tokens, temperature
-            ):
+            for msg in gen:
+                if isinstance(msg, int):
+                    prompt_tokens = msg
+                    continue
+                piece, n = msg
                 chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": MODEL_ID,
                     "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": piece},
-                            "finish_reason": None,
-                        }
+                        {"index": 0, "delta": {"content": piece}, "finish_reason": None}
                     ],
                 }
                 self._sse(json.dumps(chunk, ensure_ascii=False))
@@ -391,10 +510,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 "model": MODEL_ID,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
             }
-            self._sse(json.dumps(err_chunk, ensure_ascii=False))
+            try:
+                self._sse(json.dumps(err_chunk, ensure_ascii=False))
+            except OSError:
+                pass
 
         dt = time.time() - t0
-        prompt_tokens = getattr(self, "_prompt_tokens", 0)
         final = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -407,8 +528,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 "total_tokens": prompt_tokens + total,
             },
         }
-        self._sse(json.dumps(final, ensure_ascii=False))
-        self._sse("[DONE]")
+        try:
+            self._sse(json.dumps(final, ensure_ascii=False))
+            self._sse("[DONE]")
+        except OSError:
+            pass
         print(
             f"[API] stream done: {total} tokens in {dt:.1f}s ({total / dt:.1f} t/s) error={error}",
             file=sys.stderr,
@@ -419,10 +543,16 @@ class APIHandler(BaseHTTPRequestHandler):
         t0 = time.time()
         pieces = []
         total = 0
+        prompt_tokens = 0
+        gen = _get_engine().generate(
+            prompt, prompt_nogen, max_tokens, temperature, NO_THINK
+        )
         try:
-            for piece, n in self._generate_cached(
-                prompt, prompt_nogen, max_tokens, temperature
-            ):
+            for msg in gen:
+                if isinstance(msg, int):
+                    prompt_tokens = msg
+                    continue
+                piece, n = msg
                 pieces.append(piece)
                 total = n
         except Exception as e:
@@ -430,14 +560,13 @@ class APIHandler(BaseHTTPRequestHandler):
             return self._send_json(
                 500, {"error": "generation_error", "message": str(e)}
             )
+
         text = "".join(pieces)
         print(
             f"[API] generate done in {time.time() - t0:.3f}s",
             file=sys.stderr,
             flush=True,
         )
-
-        prompt_tokens = getattr(self, "_prompt_tokens", 0)
         resp = {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
@@ -483,8 +612,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    import os
-
     argv = sys.argv[1:]
 
     if "--list" in argv:
@@ -512,86 +639,18 @@ def main():
     cap = int(args[1]) if len(args) > 1 else DEFAULT_CAPACITY
 
     model_path, store_dir = resolve_model(model_name)
-    _mp = Path(model_path)
 
-    global MODEL_ID
+    global MODEL_ID, engine
     MODEL_ID = model_name or os.path.basename(model_path)
 
     mode = "性能" if perf else "省メモリ"
-    global model, tokenizer, cache
     print(f"モデル: {model_path}", flush=True)
-    print(
-        f"モデルをロード中...（{mode}モード, capacity={cap}）",
-        flush=True,
-    )
+    print(f"モデルをロード中...（{mode}モード, capacity={cap}）", flush=True)
     t0 = time.perf_counter()
 
-    import json
+    engine = GenerationEngine(model_path, store_dir, cap, perf)
 
-    with open(_mp / "config.json") as f:
-        _cfg = json.load(f)
-    _model_type = _cfg.get("model_type", "")
-
-    if _model_type == "deepseek_v4":
-        from model_v4 import DeepseekV4Model
-        from stream_model import _wire_deepseek_v4
-
-        model = DeepseekV4Model(str(_mp), fused_quant=True)
-        cache, _ = _wire_deepseek_v4(
-            model, cap, top_k=6, store_dir=store_dir, model_path=str(_mp)
-        )
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(str(_mp))
-    else:
-        from mlx_lm.utils import load_model as _lm_load
-
-        model, _ = _lm_load(_mp, lazy=True)
-        # トークナイザロード（カスタムtokenizer_class対応）
-        try:
-            _tok_cfg = {
-                "tokenizer_class": "PreTrainedTokenizerFast",
-                "add_prefix_space": False,
-            }
-            model2, tokenizer = _mlx_load(
-                str(_mp), tokenizer_config=_tok_cfg, lazy=True
-            )
-        except Exception:
-            from transformers import PreTrainedTokenizerFast
-            from tokenizers import Tokenizer
-
-            tk = Tokenizer.from_file(str(_mp / "tokenizer.json"))
-            tokenizer = PreTrainedTokenizerFast(tokenizer_object=tk)
-            ct_path = _mp / "chat_template.jinja"
-            if ct_path.exists():
-                tokenizer.chat_template = ct_path.read_text()
-            with open(_mp / "config.json") as f:
-                _eos_cfg = json.load(f)
-            eos_ids = _eos_cfg.get("eos_token_id", [])
-            if isinstance(eos_ids, list) and eos_ids:
-                tokenizer.eos_token_id = eos_ids[0]
-
-        import mlx.core as mx
-
-        if _model_type == "gemma4":
-            cache = None
-            mx.compile(model.__call__)
-        elif os.path.isdir(
-            os.path.join(
-                str(_mp) if _mp.is_dir() else os.path.dirname(str(_mp)), "store"
-            )
-        ):
-            cache, _ = wire_streaming(
-                model, cap, perf=perf, store_dir=store_dir, model_path=str(_mp)
-            )
-        else:
-            cache = None
-            try:
-                mx.compile(model.__call__)
-            except Exception:
-                pass
     print(f"準備完了（{time.perf_counter() - t0:.0f}秒）", flush=True)
-
     print("", flush=True)
     print(f"  ElfMoon API サーバ起動: http://{HOST}:{port}", flush=True)
     if HOST == "127.0.0.1":
