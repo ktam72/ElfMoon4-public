@@ -1,69 +1,22 @@
-# ElfMoon
+# ElfMoon4🌙
 
-**24GB Apple Silicon で 35B/80B MoE モデルを実用速度で動かす MLX 推論エンジン**
+> 24GB RAM の Apple Silicon Mac 上で 26B/35B/80BクラスのLLMを Streaming MoE あるいは オンメモリで実用速度で動かす MLX 推論エンジン（M4 Pro MacBookでのみ動作確認済み）
 
-OpenAI 互換 API サーバーと対話 CLI を同梱。Claude Code / opencode 等のツールから直接利用できる。
+OpenAI 互換 API サーバーと対話 CLI を同梱。Claude Code / opencode 等のツールからも直接利用できる。
 
-ElfMoon は全 expert を GPU に載せるのではなく、アクティブな expert だけを SSD からストリーミングロードする。ホットな expert は LRU キャッシュ（6144 スロット）に保持。
+ElfMoon は全 expert を GPU に載せるのではなく、アクティブな expert だけを SSD からストリーミングロードする（Qwen3.6-35B / Qwen3-Next-80B 等の大規模 MoE 向け）。
+ホットな expert は LRU キャッシュ（6144 スロット）に保持。
 
-2つの動作モード:
-- **省メモリモード（既定）**: 常駐 6144 experts ≈ 10.4GB。Xcode など他アプリと共存可能
-- **性能モード（`--perf`）**: 常駐 8000 experts ≈ 13.5GB。単体利用で最高速度
+一方 Gemma4 / DeepSeek-R1-Distill / GLM / Bonsai 等の通常モデルは `mlx_lm` 経由で動作する。
 
-> ⚠️ **初回セットアップ必須**: `ELFMOON_MODELS_ROOT` にモデル置き場のパスを設定すること（シェルの起動ファイルに恒久登録推奨）。未設定時は `./models`（リポジトリ直下）にフォールバックするが空なので、モデルが1つも見つからずロードに失敗する。
-> ```bash
-> echo 'export ELFMOON_MODELS_ROOT=/path/to/your/models' >> ~/.zshrc
-> source ~/.zshrc
-> ```
-> 詳細は [セットアップ](#セットアップ) を参照。
 
----
+### ElfMoon4 の独自性
 
-## 他エンジンとの比較
-
-ElfMoon4 の立ち位置を明確にするため、類似エンジンとの比較を示す。
-
-| 観点 | llama.cpp | DwarfStar4 | **ElfMoon4** |
-|------|-----------|------------|--------------|
-| **対象モデル** | 汎用 GGUF（Llama / Mistral / Qwen / DeepSeek 等） | DeepSeek V4 Flash (284B) / PRO 特化 | **Qwen3.6-35B-A3B / Qwen3-Next-80B-A3B 特化** |
-| **メモリ目標** | モデルサイズ次第（GGUF 量子化で調整） | 96GB+（ハイエンド Mac / Linux） | **24GB**（Xcode 同時起動可） |
-| **言語 / 基盤** | C/C++ + 各種 GPU バックエンド | C + Metal / CUDA / ROCm | **Python + MLX** |
-| **ビルド** | cmake / make（要コンパイル） | make（要コンパイル） | **pip install のみ**（インタプリタ） |
-| **モデル形式** | GGUF（汎用フォーマット） | GGUF（DS4 独自レイアウト） | **MLX safetensors**（標準 MLX 形式） |
-| **量子化** | 多種（Q2〜Q8、IQ シリーズ等） | 非対称 IQ2_XXS / Q2_K（2bit） | **Q4 group64 統一 + router 8bit** |
-| **SSD Streaming** | レイヤー単位（mmap × partial load） | **エキスパート単位**（per-expert cache） | **エキスパート単位**（per-expert LRU cache） |
-| **アーキテクチャ** | 汎用 Transformer / MoE | 純粋 Transformer MoE | **ハイブリッド対応**（線形 attention + full attention） |
-| **分散推論** | 対応 | **マルチマシン TCP 分割** | シングルマシンのみ |
-| **エージェント連携** | 外部 API 経由 | **ネイティブ DSML エージェント内蔵** | OpenAI API 経由の外部連携 |
-| **API 互換性** | OpenAI 互換サーバー同梱 | OpenAI / Anthropic / Responses 対応 | **OpenAI 互換**（`/v1/chat/completions`） |
-| **HW バックエンド** | Metal / CUDA / Vulkan / SYCL / etc. | Metal / CUDA / ROCm | **MLX のみ**（Metal 内部利用） |
-| **エキスパートグループ化プリフィル** | なし | なし | **○（148 t/s、24倍高速化）** |
-| **`@mx.compile` JIT デコード** | なし | なし | **○（16-22 t/s デコード）** |
-| **Eco / Perf デュアルモード** | なし | なし | **○（~10.4GB / ~13.5GB 切替）** |
-| **80B モデル対応** | 対応（要十分な RAM） | 対応（284B 対応、要 96GB+） | **○（実験的、24GB で動作）** |
-| **コード規模** | ~200,000行 C++ | ~30,000行 C + GPU カーネル | **~2,000行 Python** |
-| **移植性** | ほぼ全ての環境 | Mac + Linux (CUDA/ROCm) | **Apple Silicon 専用** |
-| **ライセンス** | MIT | MIT + GGML attribution | **Apache 2.0** |
-
-### ElfMoon4 の独自性（3 エンジン中最も特長的な点）
-
-- **最小メモリフットプリント**: llama.cpp / DS4 が 96GB+ を要求する中、**24GB で 35B/80B MoE モデルを実用速度で動作させる唯一のエンジン**。Xcode など他アプリとの同時起動も想定。
-- **Python/MLX スタック**: コンパイル不要で即利用可能。C/C++ エンジンにはない `@mx.compile` JIT や MLX の自動 Metal ディスパッチを活用。
-- **ハイブリッドアーキテクチャ対応**: Qwen3.6 の GatedDeltaNet（線形 attention）と full attention の混在をサポート。純粋 Transformer のみの DS4 や llama.cpp の汎用 MoE とは異なるレイヤーを扱える。
+- **デュアルモード推論**: ストリーミング MoE（大規模 expert 分解モデル）と `mlx_lm` 経由のオンメモリモデルの両方を同じ `chat.py` / `api_server.py` で透過的に扱える。
+- **ストリーミング MoE**: 全 expert を GPU に載せず、アクティブな expert だけを SSD から LRU キャッシュにストリーミング。**24GB で 80B+ MoE モデルを実用速度で動作**。Xcode など他アプリとの同時起動も想定。
+- **Python/MLX スタック**: コンパイル不要で即利用可能。C/C++ エンジンにはない `@mx.compile` JIT や MLX の自動 Metal ディスパッチを活用。Gemma4 系で最大 85 tok/s を達成。
 - **エキスパートグループ化プリフィル**: プリフィル時に同一エキスパートにルーティングされたトークンをまとめて計算。DS4 や llama.cpp にない独自最適化で 24 倍のプリフィル高速化を達成。
-- **実環境での実証**: M4 Pro 24GB で Xcode 動作中に 12.6 t/s を達成する等、「研究室内のベンチマーク」ではなく**実際の開発ワークフローで使える**ことを検証済み。
-
----
-
-## パフォーマンス（M4 Pro 24GB）
-
-| モデル | デコード t/s | ピークメモリ |
-|--------|:-:|:-:|
-| **Qwen3.6-35B-A3B**（推奨） | ~16-22 | 12.7 GB |
-| **Qwen3-Next-80B-A3B**（実験的） | ~9.7-10 | 12.9 GB |
-| **Qwen3-Coder-Next**（実験的） | ~10-12.5 | 12.3 GB |
-
-decodeホットパスの `mx.stack` 呼び出し削減（2026-07-11）で 35B/Coder-Next は +25〜36% 高速化（80Bはtop_kの違いか、恩恵ほぼ横ばい）。35B はウォームで最大 ~22 t/s、80B は計算律速で ~10 t/s 前後。
+- **広範なモデル対応**: Qwen3.6 (MoE+dense) / Qwen3-Next-80B / Qwen3-Coder-Next / Gemma4 / GLM-4.7 / DeepSeek-R1-Distill / Bonsai 等、MLX エコシステムの多様なモデルを同一インターフェースで利用可能。
 
 ---
 
@@ -71,19 +24,37 @@ decodeホットパスの `mx.stack` 呼び出し削減（2026-07-11）で 35B/Co
 
 | 項目 | 要件 |
 |---|---|
-| ハードウェア | Apple Silicon Mac（M1 以降）、**RAM 24GB 推奨**（容量を下げれば 16GB でも可） |
-| OS | macOS 14 以降 |
+| ハードウェア | Apple Silicon Mac（M1 以降）、**RAM 24GB 推奨**（メモリ使用オプションを下げれば 16GB でも可のはず） |
+| OS | macOS 14 以降 （26.5以降推奨）|
 | Python | 3.10 以降 |
 | ディスク空き | 35B: ~47GB / 80B・Coder-Next: ~84GB（元モデル + 分解済 expert、`ELFMOON_MODELS_ROOT` 配下） |
 | 依存 | MLX / mlx-lm / **transformers==4.57.6**（5.x は非互換） |
 
 ---
+## 動作確認済みモデル
+
+| モデル | タイプ | サイズ | デコード t/s | 備考 |
+|---|---|---|---|---|---|
+| **[Gemma4-26B-A4B-it-4bit](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-4bit)**（最推奨） | オンメモリ | 15 GB | **~70-85** | `mx.compile` で 5×高速化。品質・速度・メモリの最適バランス |
+| **[Gemma4-26B-A4B-it-heretic-4bit](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-heretic-4bit)**（最推奨） | オンメモリ | 15.6 GB | **~70-85** | Heretic 変種、同一性能 |
+| **[Qwen3.6-35B-A3B](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)**（推奨） | ストリーミング MoE | 19 GB | ~16-22 | 思考モード対応、高速 |
+| **[Qwen3.6-35B-A3B-uncensored-heretic](https://huggingface.co/froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit)**（実験的） | ストリーミング MoE | 19 GB | ~16-22 | Heretic 変種、要分解 |
+| **[DeepSeek-R1-Distill-Qwen-14B-4bit](https://huggingface.co/mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit)** | オンメモリ | 8.3 GB | ~30 | 軽量、日本語推論可 |
+| **[DeepSeek-R1-Distill-Qwen-32B-4bit](https://huggingface.co/mlx-community/DeepSeek-R1-Distill-Qwen-32B-Japanese-4bit)** | オンメモリ | 17 GB | ~12 | 日本語特化、思考プロセス表示 |
+| **[Ternary-Bonsai-27B-2bit](https://huggingface.co/mlx-community/Ternary-Bonsai-27B-2bit)** | オンメモリ | 8.5 GB | ~21.6 | 2bit ternary、軽量 |
+| **[GLM-4.7-Flash-4bit](https://huggingface.co/mlx-community/GLM-4.7-Flash-4bit)** | オンメモリ | 16.9 GB | ~16.9 | Zhipu 製、日本語可 |
+| **[Qwen3-Next-80B-A3B](https://huggingface.co/mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit)**（実験的） | ストリーミング MoE | 42 GB | ~9.7-10 | 品質重視向け |
+| **[Qwen3-Coder-Next](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit)**（実験的） | ストリーミング MoE | 42 GB | ~10-12.5 | コード特化 |
+| **[Qwen3.6-27B-4bit](https://huggingface.co/mlx-community/Qwen3.6-27B-4bit)** | オンメモリ | ~15 GB | ~11.5 | dense 27B |
+| **[Qwen3.5-REAP-97B-A10B](https://huggingface.co/mlx-community/Qwen3.5-REAP-97B-A10B-4bit)**（非推奨） | ストリーミング MoE | 51 GB | ~3.4 | capacity 要大幅減 |
+
+---
 
 ## セットアップ
 
-### モデル置き場（ELFMOON_MODELS_ROOT）
+### AIモデルファイル置き場（環境変数：ELFMOON_MODELS_ROOT）
 
-ElfMoon 本体はモデルの実体を一切知らない。**`ELFMOON_MODELS_ROOT` が唯一の結合点**で、その配下に
+ElfMoon 本体は、環境変数`ELFMOON_MODELS_ROOT`に指定されたディレクトリをAIモデルファイル参照場所として認識する。
 
 ```
 <ELFMOON_MODELS_ROOT>/
@@ -92,56 +63,61 @@ ElfMoon 本体はモデルの実体を一切知らない。**`ELFMOON_MODELS_ROO
     store/                                      ← integrate.py split_all が自動生成
 ```
 
-という規約でモデルを1つ1つ独立したディレクトリとして置くだけでよい。追加・削除は該当ディレクトリの追加・`rm -rf`のみ。外部SSD等どこに置いてもよく、指すのは環境変数1つだけ:
+という規約でモデルを1つ1つ独立したディレクトリとして置くだけでよい。
+
+> ⚠️ **初回セットアップ必須**: `ELFMOON_MODELS_ROOT` にAIモデルファイル置き場のパスを設定すること（シェルの起動ファイルに恒久登録推奨。外付けSSD推奨）。未設定時は `./models`（リポジトリ直下）にフォールバックするが空なので、モデルが1つも見つからずロードに失敗する。
+> ```bash
+> echo 'export ELFMOON_MODELS_ROOT=/path/to/your/models' >> ~/.zshrc
+> source ~/.zshrc
+> ```
+>
+
+
+2種類のモデル形式はディレクトリ構成から自動判別:
+- **オンメモリモード（`mlx_lm` 経由）**: `store/` ディレクトリがない通常モデル。全重みをメモリにロードし `mx.compile` で高速化（Gemma4 は 70+ tok/s）
+- **ストリーミング MoE**: `store/` ディレクトリがある分解済み MoE モデル。expert を SSD から LRU キャッシュにストリーミング
+
+
+追加・削除は該当ディレクトリの追加・`rm -rf`のみ。外部SSD等どこに置いてもよく、指すのは環境変数1つだけ:　以下例。
 
 ```bash
 export ELFMOON_MODELS_ROOT=/Volumes/990Pro_2TB/elfmoon/models   # 例: 外部SSD
 # 未設定時は ./models（リポジトリ直下）が既定
 ```
 
+### 依存ファイルのインストール
 ```bash
 # 依存
 pip install mlx mlx-lm "transformers==4.57.6" huggingface_hub hf_transfer
+```
 
-# モデルダウンロード（Qwen3.6-35B-A3B, MLX 4bit, ~19GB）← 推奨・既定
+
+
+### ストリーミング MoE モデル（大規模 MoE）
+
+`integrate.py split_all` で expert 分解が必要（`store/` ディレクトリを生成）。
+
+```bash
+# Qwen3.6-35B（推奨 MoE、16-22 tok/s）
 HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3.6-35B-A3B-4bit \
   --local-dir $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx
+python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx
+python3 elfmoon/chat.py --model qwen3.6-35b-mlx
 
-# expert 分解（40層 × 256 expert = 10240 ファイル、モデル直下の store/ に生成）
-cd elfmoon
-python3 integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx
-
-# 利用可能なモデル一覧
-python3 chat.py --list
-```
-
-### 80B モデル（オプション）
-
-```bash
+# Qwen3-Next-80B（実験的）
 HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit \
   --local-dir $ELFMOON_MODELS_ROOT/qwen3-next-80b-mlx
+python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3-next-80b-mlx
+python3 elfmoon/chat.py --model qwen3-next-80b-mlx
 
-cd elfmoon
-python3 integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3-next-80b-mlx
-
-python3 chat.py --model qwen3-next-80b-mlx
-```
-
-### Coder-Next モデル（オプション、コード特化）
-
-80B と同一トポロジ（hidden2048 / 48層 / 512expert / top_k10）のため、`stream_model.py` / `integrate.py` は無改造で動作する。
-
-```bash
+# Qwen3-Coder-Next（コード特化）
 HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3-Coder-Next-4bit \
   --local-dir $ELFMOON_MODELS_ROOT/qwen3-coder-next-4bit
-
-cd elfmoon
-python3 integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3-coder-next-4bit
-
-python3 chat.py --model qwen3-coder-next-4bit
+python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3-coder-next-4bit
+python3 elfmoon/chat.py --model qwen3-coder-next-4bit
 ```
 
-> ⚠️ 配布物の `tokenizer_config.json` は `extra_special_tokens` が list 形式で、transformers 4.57.6 は dict `{name: token}` を要求するため読み込みエラーになる。ダウンロード後、モデルディレクトリ内の `tokenizer_config.json` を以下で変換する（元ファイルは `tokenizer_config.json.orig` に退避、重み本体は無傷）:
+> ⚠️ Coder-Next / Qwen3.5-REAP の `tokenizer_config.json` は `extra_special_tokens` が list 形式で、transformers 4.57.6 は dict を要求する。以下の変換が必要:
 > ```bash
 > cd $ELFMOON_MODELS_ROOT/qwen3-coder-next-4bit
 > cp tokenizer_config.json tokenizer_config.json.orig
@@ -154,54 +130,78 @@ python3 chat.py --model qwen3-coder-next-4bit
 > "
 > ```
 
-### Qwen3.5-REAP-97B-A10B（試験導入・非推奨）
 
-REAP刈込で97Bまで圧縮されているが active パラメータは10B級のままで、実測 **decode 3.4 t/s・ピーク14.4GB** と実用ラインを下回る。動作可能だが80B/Coder-Nextの方が速く軽い。
+
+### オンメモリモデル（推奨: Gemma4-26B）
+
+分解不要。`store/` ディレクトリがなくてもそのまま動作する。ダウンロードのみで完了:
+
+```bash
+HF_HUB_DISABLE_XET=1 hf download mlx-community/gemma-4-26B-A4B-it-4bit \
+  --local-dir $ELFMOON_MODELS_ROOT/gemma-4-26b-a4b-it-4bit
+
+python3 elfmoon/chat.py --model gemma-4-26b-a4b-it-4bit
+```
+
+> Gemma4 は `mx.compile` により約 5× 高速化（70-85 tok/s）、品質・速度・メモリの最適バランス。**最も推奨するモデル。**
+
+### Heretic / アブリテイテッド変種
+
+通常版と同一手順でダウンロードするだけ:
+
+```bash
+# Gemma4 Heretic 変種（同一速度・メモリ）
+HF_HUB_DISABLE_XET=1 hf download mlx-community/gemma-4-26B-A4B-it-heretic-4bit \
+  --local-dir $ELFMOON_MODELS_ROOT/gemma-4-26b-a4b-it-heretic-4bit
+
+python3 elfmoon/chat.py --model gemma-4-26b-a4b-it-heretic-4bit
+
+# Qwen3.6-35B Heretic 変種（ストリーミング MoE、分解必須）
+HF_HUB_DISABLE_XET=1 hf download froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit \
+  --local-dir $ELFMOON_MODELS_ROOT/qwen3.6-35b-uncensored-heretic-mlx
+python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3.6-35b-uncensored-heretic-mlx
+
+python3 elfmoon/chat.py --model qwen3.6-35b-uncensored-heretic-mlx
+```
+
+### GLM / Bonsai / DeepSeek-R1 等
+
+すべて分解不要。`hf download` で `ELFMOON_MODELS_ROOT/<モデル名>` にダウンロードし、`--model` で指定するだけ:
+
+```bash
+HF_HUB_DISABLE_XET=1 hf download mlx-community/GLM-4.7-Flash-4bit \
+  --local-dir $ELFMOON_MODELS_ROOT/glm-4.7-flash-4bit
+
+HF_HUB_DISABLE_XET=1 hf download mlx-community/Ternary-Bonsai-27B-2bit \
+  --local-dir $ELFMOON_MODELS_ROOT/ternary-bonsai-27b-2bit
+
+HF_HUB_DISABLE_XET=1 hf download mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit \
+  --local-dir $ELFMOON_MODELS_ROOT/deepseek-r1-distill-qwen-14b-4bit
+```
+
+### Qwen3.5-REAP-97B-A10B（非推奨）
+
+REAP 刈込で 97B まで圧縮されているが active パラメータは 10B 級で decode ~3.4 t/s と実用ラインを下回る。
 
 ```bash
 HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3.5-REAP-97B-A10B-4bit \
   --local-dir $ELFMOON_MODELS_ROOT/qwen3.5-reap-97b-4bit
+python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3.5-reap-97b-4bit
 
-cd elfmoon
-python3 integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3.5-reap-97b-4bit
-
-# expert 1個が約5.3MBと大きいため、既定 capacity=6144 だと約33GB要求してMetal OOMする。
-# 必ず capacity を明示的に下げること（例: 10GB予算なら約1900）
-python3 chat.py --model qwen3.5-reap-97b-4bit 1900
+# expert サイズが大きい（~5.3MB/個）ため capacity を明示的に下げること
+python3 elfmoon/chat.py --model qwen3.5-reap-97b-4bit 1900
 ```
 
-> ⚠️ `tokenizer_config.json` の `tokenizer_class` が `TokenizersBackend` になっており transformers 4.57.6 で読めない。`PreTrainedTokenizerFast` に書き換える（Coder-Next と同様、元ファイルは `.orig` に退避）:
+> ⚠️ `tokenizer_class` が `TokenizersBackend` になっている。`PreTrainedTokenizerFast` に書き換えが必要:
 > ```bash
 > cd $ELFMOON_MODELS_ROOT/qwen3.5-reap-97b-4bit
 > cp tokenizer_config.json tokenizer_config.json.orig
 > python3 -c "
-> import json
-> c = json.load(open('tokenizer_config.json'))
+> import json; c = json.load(open('tokenizer_config.json'))
 > c['tokenizer_class'] = 'PreTrainedTokenizerFast'
 > json.dump(c, open('tokenizer_config.json','w'), ensure_ascii=False, indent=2)
 > "
 > ```
-
-### Kimi-Linear-48B-A3B（Qwen以外・初のMoE対応例）
-
-総48B/active~3B。Qwenとルーティング方式が異なる（sigmoid + 補正バイアス + スケーリング、shared_expertsにゲートなし）が、`stream_model.py` が自動検出・対応する（`_read_routing_config` が config.json の `moe_router_activation_func`/`routed_scaling_factor` を読み取る）。
-
-```bash
-pip install tiktoken   # カスタムtokenizerに必要
-
-HF_HUB_DISABLE_XET=1 hf download mlx-community/Kimi-Linear-48B-A3B-Instruct-4bit \
-  --local-dir $ELFMOON_MODELS_ROOT/kimi-linear-48b-a3b-4bit
-
-cd elfmoon
-python3 integrate.py split_all $ELFMOON_MODELS_ROOT/kimi-linear-48b-a3b-4bit
-
-# expert 1個が約4.0MBのため、既定 capacity=6144 だと約24.5GB要求してMetal OOMする
-# （即クラッシュでなく会話が進みKVキャッシュが積み増された後に落ちるため気づきにくい）。
-# 必ず capacity を明示的に下げること（例: 10GB予算なら約2500、13GB予算なら約3200）
-python3 chat.py --model kimi-linear-48b-a3b-4bit 2500
-```
-
-> ⚠️ 起動時に `trust_remote_code` の確認プロンプトが出る（カスタムtokenizer実装のため）。内容は標準的なtiktokenラッパーで危険なパターンは含まれない（要約: `subprocess`/`eval`/ネットワーク呼び出しなし）。`y` で承認するか、`tokenizer_config={"trust_remote_code": True}` を明示する。
 
 ---
 
@@ -210,32 +210,37 @@ python3 chat.py --model kimi-linear-48b-a3b-4bit 2500
 ### 対話CLI: chat.py
 
 ```bash
-cd elfmoon
-python3 chat.py                                # 省メモリモード（既定モデル）
-python3 chat.py --model qwen3-next-80b-mlx     # モデル指定（ELFMOON_MODELS_ROOT配下のディレクトリ名）
-python3 chat.py --perf                         # 性能モード
-python3 chat.py 2048                           # 省メモリ（容量指定）
-python3 chat.py --no-think                     # 思考プロセスを非表示
-python3 chat.py --list                         # ELFMOON_MODELS_ROOT 配下のモデル一覧
+python3 elfmoon/chat.py                                # 既定モデル（$ELFMOON_MODELS_ROOT 直下から自動選択）
+python3 elfmoon/chat.py --model gemma-4-26b-a4b-it-4bit   # オンメモリモデル
+python3 elfmoon/chat.py --model qwen3.6-35b-mlx            # ストリーミング MoE
+python3 elfmoon/chat.py --perf                             # 性能モード（ストリーミング MoE 時）
+python3 elfmoon/chat.py 2048                               # 常駐 expert 数指定（ストリーミング MoE 時）
+python3 elfmoon/chat.py --no-think                          # 思考プロセスを非表示
+python3 elfmoon/chat.py --list                              # モデル一覧
 ```
+
+> ⚠️ モデルは `ELFMOON_MODELS_ROOT/<モデル名>/` 以下に置くだけで自動認識される（台帳ファイル不要）。
 
 - 起動時にモデルパス・モード・実効容量・GB を表示
 - モデルを 1 回ロードするだけで対話ループ。`exit` で終了
 - 日本語・英語どちらでも可
+- オンメモリモデル（`store/` なし）は `--perf` / expert 数指定が不要。`store/` のある MoE モデルは従来通り LRU キャッシュで容量調整可能
 
 ### API サーバー: api_server.py
 
 ```bash
 python3 elfmoon/api_server.py                          # 省メモリモード（既定モデル）
-python3 elfmoon/api_server.py --model qwen3-next-80b-mlx
-python3 elfmoon/api_server.py --perf                   # 性能モード
-python3 elfmoon/api_server.py 8080 2048                # ポート・常駐容量を指定
-python3 elfmoon/api_server.py --list                   # モデル一覧
+python3 elfmoon/api_server.py --model gemma-4-26b-a4b-it-4bit   # オンメモリモデル
+python3 elfmoon/api_server.py --model qwen3-next-80b-mlx         # ストリーミング MoE
+python3 elfmoon/api_server.py --perf                             # 性能モード（ストリーミング MoE 時）
+python3 elfmoon/api_server.py 8080 2048                          # ポート・常駐容量を指定
+python3 elfmoon/api_server.py --list                             # モデル一覧
 # → http://127.0.0.1:11434 で起動
 ```
 
 引数: `python3 elfmoon/api_server.py [port] [常駐expert数] [--model NAME] [--no-think] [--perf]`
 環境変数: `ELFMOON_PERF=1`（`--perf` と同等）、`ELFMOON_MODELS_ROOT`（モデル置き場）
+- オンメモリモデル（`store/` なし）は `--perf` / expert 数指定が不要
 
 OpenAI 互換エンドポイント:
 | エンドポイント | 用途 |
@@ -261,7 +266,7 @@ ELFMOON_HOST=0.0.0.0 python3 elfmoon/api_server.py
 ```
 > ⚠️ 認証機構はない。信頼できるネットワークでのみ公開。
 
-### 常駐容量の調整
+### 常駐容量の調整（ストリーミング MoE モデルのみ）
 
 ```bash
 python3 elfmoon/api_server.py 11434 6144          # 既定、10.4GB
@@ -269,15 +274,30 @@ python3 elfmoon/api_server.py 11434 6144 --perf   # 性能モード、13.5GB
 python3 elfmoon/api_server.py 11434 2048          # 省メモリ、3.5GB
 ```
 
-常駐 expert 数 × 1.69MB がキャッシュメモリ量の目安。`--perf` で最大 8000 experts（≈13.5GB）。
+常駐 expert 数 × 1.69MB（Qwen の場合）がキャッシュメモリ量の目安。モデルにより expert サイズは異なる（1.7〜5.3MB）。`--perf` で最大 8000 experts（≈13.5GB）。
+オンメモリモデルでは指定不要。
 
-### KV Cache クリア
+### KV Cache クリア / 保存先変更
 
 ```bash
+# クリア
 rm -rf ~/.cache/elfmoon/kv_cache
+# または環境変数で指定した場所
+rm -rf "$ELFMOON_KV_CACHE_DIR"
 ```
 
+**保存先の変更**: `ELFMOON_KV_CACHE_DIR` 環境変数で任意のディレクトリを指定可能。
+
+```bash
+# 外部 SSD に保存（Macintosh HD の逼迫回避）
+export ELFMOON_KV_CACHE_DIR=/Volumes/990Pro_2TB/elfmoon/kv_cache
+python3 elfmoon/api_server.py
+```
+
+未設定時は `~/.cache/elfmoon/kv_cache`（既定）。
+
 ---
+# その他
 
 ## テスト・検証
 
@@ -301,19 +321,29 @@ python3 integrate.py verify $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx /tmp/elfmoon_ve
 | メモリ逼迫 / Metal OOM | 常駐容量を下げる（例: `api_server.py 11434 2048`）。expertサイズはモデルにより異なる（1.7〜5.3MB）ため、大きいexpertのモデルは既定値6144だと溢れることがある |
 | ポート競合（Ollama） | 別ポートで起動（例: `api_server.py 8080`） |
 | 応答品質が急に劣化 | `rm -rf ~/.cache/elfmoon/kv_cache` でキャッシュクリア |
-| `--model NAME` でモデルが見つからない | `python3 chat.py --list` で `ELFMOON_MODELS_ROOT` 配下の認識状況を確認 |
+| `--model NAME` でモデルが見つからない | `python3 elfmoon/chat.py --list` で `ELFMOON_MODELS_ROOT` 配下の認識状況を確認 |
 
 ---
 
-## 対応モデル
 
-| モデル | サイズ | expert 数 | デコード t/s | 備考 |
-|---|---|---|---|---|
-| **[Qwen3.6-35B-A3B](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)**（推奨） | 19 GB | 10240 | ~16-22 | 思考モード対応、高速 |
-| **[Qwen3-Next-80B-A3B](https://huggingface.co/mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit)**（実験的） | 42 GB | 24576 | ~9.7-10 | 品質重視向け、`--model` で切替 |
-| **[Qwen3-Coder-Next](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit)**（実験的） | 42 GB | 24576 | ~10-12.5 | コード特化、tokenizer_config.json 要変換 |
-| **[Qwen3.5-REAP-97B-A10B](https://huggingface.co/mlx-community/Qwen3.5-REAP-97B-A10B-4bit)**（非推奨） | 51 GB | 9600 | ~3.4 | active 10B級で実用ラインを下回る。capacity要大幅減（既定値だとOOM） |
-| **[Kimi-Linear-48B-A3B](https://huggingface.co/mlx-community/Kimi-Linear-48B-A3B-Instruct-4bit)**（実験的・Qwen以外） | 26 GB | 6656 | ~15-19 | active 3B級で実用速度。sigmoid routing対応が必要だった。capacity要下げ（既定値だとOOM、`--model ... 2500`目安） |
+## パフォーマンス（M4 Pro 24GB）
+
+| モデル | タイプ | デコード t/s | ピークメモリ |
+|--------|--------|:-:|:-:|
+| **Gemma4-26B-A4B-it-4bit** | オンメモリ | **~70-85** | ~10 GB |
+| **Gemma4-26B-A4B-it-heretic-4bit** | オンメモリ | **~70-85** | ~10 GB |
+| **Qwen3.6-35B-A3B**（推奨） | ストリーミング MoE | ~16-22 | 12.7 GB |
+| **Ternary-Bonsai-27B-2bit** | オンメモリ | ~21.6 | 8.5 GB |
+| **GLM-4.7-Flash-4bit** | オンメモリ | ~16.9 | 16.9 GB |
+| **DeepSeek-R1-Distill-Qwen-14B-4bit** | オンメモリ | ~30 | 8.3 GB |
+| **DeepSeek-R1-Distill-Qwen-32B-4bit** | オンメモリ | ~12 | 17 GB |
+| **Qwen3-Next-80B-A3B**（実験的） | ストリーミング MoE | ~9.7-10 | 12.9 GB |
+| **Qwen3-Coder-Next**（実験的） | ストリーミング MoE | ~10-12.5 | 12.3 GB |
+| **Qwen3.6-27B-4bit** | オンメモリ | ~11.5 | ~15 GB |
+
+- オンメモリモデルは `mx.compile` による JIT コンパイル済み（Gemma4 系は約 5× 高速化、Qwen/GLM/Bonsai は 1.2-1.5×）
+- ストリーミング MoE モデルはエキスパートグループ化プリフィル（最大 24 倍高速化）と LRU キャッシュで low-memory 動作を実現
+- Gemma4 は品質・速度・メモリの最適バランス。会話・コード・推論いずれも高品質
 
 ---
 
@@ -350,16 +380,25 @@ ElfMoon4/
 
 ```
 $ELFMOON_MODELS_ROOT/
-├── qwen3.6-35b-mlx/            # モデル名 = ディレクトリ名（--model 引数に使う値）
-│   ├── config.json             #   ← ダウンロードした元モデル一式
-│   ├── tokenizer.json
-│   ├── tokenizer_config.json
-│   ├── model-00001-of-*.safetensors
-│   ├── ...
-│   └── store/                  #   ← integrate.py split_all が自動生成
-│       ├── l0_e0.safetensors   #     層l・expert eごとに1ファイル
+├── gemma-4-26b-a4b-it-4bit/          # オンメモリ（store/ なし）
+│   ├── config.json, *.safetensors, tokenizer...
+├── gemma-4-26b-a4b-it-heretic-4bit/  # オンメモリ heretic 変種
+│   ├── config.json, *.safetensors, tokenizer...
+├── glm-4.7-flash-4bit/               # オンメモリ
+│   ├── config.json, *.safetensors...
+├── ternary-bonsai-27b-2bit/          # オンメモリ
+│   ├── config.json, *.safetensors...
+├── deepseek-r1-distill-qwen-32b-japanese-4bit/
+├── deepseek-r1-distill-qwen-14b-4bit/
+├── qwen3.6-35b-mlx/                  # ストリーミング MoE（store/ あり）
+│   ├── config.json, *.safetensors...
+│   └── store/                        # integrate.py split_all が自動生成
+│       ├── l0_e0.safetensors         # 層l・expert eごとに1ファイル
 │       ├── l0_e1.safetensors
-│       └── ...                 #     (40層×256expert=10240ファイル 等、モデルにより数が異なる)
+│       └── ...
+├── qwen3.6-35b-uncensored-heretic-mlx/
+│   ├── config.json, *.safetensors...
+│   └── store/
 ├── qwen3-next-80b-mlx/
 │   ├── config.json, ...
 │   └── store/
@@ -371,8 +410,8 @@ $ELFMOON_MODELS_ROOT/
     └── store/
 ```
 
-- `config.json` の有無で `python3 chat.py --list` がモデルとして認識するかを判定する（台帳ファイルは存在しない＝規約ベースの自動検出）
-- `store/` が無い場合は `integrate.py split_all <model_dir>` を実行するまで未分解のまま（`--list` は `⚠️ store/ 未生成` と表示）
+- `config.json` の有無で `python3 elfmoon/chat.py --list` がモデルとして認識するかを判定する（台帳ファイルは存在しない＝規約ベースの自動検出）
+- `store/` が無い通常モデル（オンメモリ）はそのまま動作。`store/` がある MoE モデルのみ `integrate.py split_all` による分解が必須（`--list` は `⚠️ store/ 未生成` と表示）
 - モデルと store は同一ディレクトリ配下にあるため、ディレクトリごと `mv` すれば対応関係が壊れずに移動できる
 
 ---

@@ -31,8 +31,10 @@ Claude Code から使う場合 (~/.clauderc.json):
 """
 
 import json
+
 import logging
 import os
+from pathlib import Path
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -168,7 +170,9 @@ class APIHandler(BaseHTTPRequestHandler):
         )
 
         if not messages:
-            return self._send_json(400, {"error": "invalid_request", "message": "messages is required"})
+            return self._send_json(
+                400, {"error": "invalid_request", "message": "messages is required"}
+            )
 
         max_tokens = min(body.get("max_tokens", MAX_TOKENS), MAX_TOKENS)
         temperature = body.get("temperature", TEMP)
@@ -277,7 +281,9 @@ class APIHandler(BaseHTTPRequestHandler):
             sampler = make_sampler(temp=temperature)
             detokenizer = tokenizer.detokenizer
             detokenizer.reset()
-            eos_ids = getattr(tokenizer, "eos_token_ids", None) or {tokenizer.eos_token_id}
+            eos_ids = getattr(tokenizer, "eos_token_ids", None) or {
+                tokenizer.eos_token_id
+            }
             stripper = ThinkStripper() if NO_THINK else None
             n = 0
 
@@ -355,7 +361,9 @@ class APIHandler(BaseHTTPRequestHandler):
         error = False
 
         try:
-            for piece, n in self._generate_cached(prompt, prompt_nogen, max_tokens, temperature):
+            for piece, n in self._generate_cached(
+                prompt, prompt_nogen, max_tokens, temperature
+            ):
                 chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -373,7 +381,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 total = n
         except Exception as e:
             error = True
-            print(f"[API] stream error at token {total}: {e}", file=sys.stderr, flush=True)
+            print(
+                f"[API] stream error at token {total}: {e}", file=sys.stderr, flush=True
+            )
             err_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -410,12 +420,16 @@ class APIHandler(BaseHTTPRequestHandler):
         pieces = []
         total = 0
         try:
-            for piece, n in self._generate_cached(prompt, prompt_nogen, max_tokens, temperature):
+            for piece, n in self._generate_cached(
+                prompt, prompt_nogen, max_tokens, temperature
+            ):
                 pieces.append(piece)
                 total = n
         except Exception as e:
             print(f"[API] generate error: {e}", file=sys.stderr, flush=True)
-            return self._send_json(500, {"error": "generation_error", "message": str(e)})
+            return self._send_json(
+                500, {"error": "generation_error", "message": str(e)}
+            )
         text = "".join(pieces)
         print(
             f"[API] generate done in {time.time() - t0:.3f}s",
@@ -476,8 +490,13 @@ def main():
     if "--list" in argv:
         models = list_models()
         print(f"利用可能なモデル（ELFMOON_MODELS_ROOT={MODELS_ROOT}）:")
-        for name, has_store in models:
-            print(f"  {name}" + ("" if has_store else "  ⚠️ store/ 未生成（integrate.py split_all が必要）"))
+        for name, has_store, is_native in models:
+            if is_native:
+                print(f"  {name}  ✅ オンメモリ動作")
+            elif has_store:
+                print(f"  {name}")
+            else:
+                print(f"  {name}  ⚠️ store/ 未生成（integrate.py split_all が必要）")
         if not models:
             print("  (見つかりません)")
         return
@@ -493,6 +512,7 @@ def main():
     cap = int(args[1]) if len(args) > 1 else DEFAULT_CAPACITY
 
     model_path, store_dir = resolve_model(model_name)
+    _mp = Path(model_path)
 
     global MODEL_ID
     MODEL_ID = model_name or os.path.basename(model_path)
@@ -505,10 +525,71 @@ def main():
         flush=True,
     )
     t0 = time.perf_counter()
-    # Load model with tokenizer using PreTrainedTokenizerFast for Qwen3.6 compat
-    _tok_cfg = {"tokenizer_class": "PreTrainedTokenizerFast", "add_prefix_space": False}
-    model, tokenizer = _mlx_load(model_path, tokenizer_config=_tok_cfg, lazy=True)
-    cache, _ = wire_streaming(model, cap, perf=perf, store_dir=store_dir, model_path=model_path)
+
+    import json
+
+    with open(_mp / "config.json") as f:
+        _cfg = json.load(f)
+    _model_type = _cfg.get("model_type", "")
+
+    if _model_type == "deepseek_v4":
+        from model_v4 import DeepseekV4Model
+        from stream_model import _wire_deepseek_v4
+
+        model = DeepseekV4Model(str(_mp), fused_quant=True)
+        cache, _ = _wire_deepseek_v4(
+            model, cap, top_k=6, store_dir=store_dir, model_path=str(_mp)
+        )
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(str(_mp))
+    else:
+        from mlx_lm.utils import load_model as _lm_load
+
+        model, _ = _lm_load(_mp, lazy=True)
+        # トークナイザロード（カスタムtokenizer_class対応）
+        try:
+            _tok_cfg = {
+                "tokenizer_class": "PreTrainedTokenizerFast",
+                "add_prefix_space": False,
+            }
+            model2, tokenizer = _mlx_load(
+                str(_mp), tokenizer_config=_tok_cfg, lazy=True
+            )
+        except Exception:
+            from transformers import PreTrainedTokenizerFast
+            from tokenizers import Tokenizer
+
+            tk = Tokenizer.from_file(str(_mp / "tokenizer.json"))
+            tokenizer = PreTrainedTokenizerFast(tokenizer_object=tk)
+            ct_path = _mp / "chat_template.jinja"
+            if ct_path.exists():
+                tokenizer.chat_template = ct_path.read_text()
+            with open(_mp / "config.json") as f:
+                _eos_cfg = json.load(f)
+            eos_ids = _eos_cfg.get("eos_token_id", [])
+            if isinstance(eos_ids, list) and eos_ids:
+                tokenizer.eos_token_id = eos_ids[0]
+
+        import mlx.core as mx
+
+        if _model_type == "gemma4":
+            cache = None
+            mx.compile(model.__call__)
+        elif os.path.isdir(
+            os.path.join(
+                str(_mp) if _mp.is_dir() else os.path.dirname(str(_mp)), "store"
+            )
+        ):
+            cache, _ = wire_streaming(
+                model, cap, perf=perf, store_dir=store_dir, model_path=str(_mp)
+            )
+        else:
+            cache = None
+            try:
+                mx.compile(model.__call__)
+            except Exception:
+                pass
     print(f"準備完了（{time.perf_counter() - t0:.0f}秒）", flush=True)
 
     print("", flush=True)

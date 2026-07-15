@@ -27,14 +27,21 @@ from typing import Any
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, KVCache
 
-DISK_CACHE_DIR = os.path.expanduser("~/.cache/elfmoon/kv_cache")
+DISK_CACHE_DIR = os.environ.get("ELFMOON_KV_CACHE_DIR") or os.path.expanduser(
+    "~/.cache/elfmoon/kv_cache"
+)
 MAX_DISK_ENTRIES = 4
 MIN_SAVE_TOKENS = 20
 FORMAT_VERSION = 2
 
 
-def _build_cache_objects(offset: int, layer_data: list[tuple[str, Any]], n_layers: int) -> list[Any]:
-    """保存データからキャッシュオブジェクトを再構築する。"""
+def _build_cache_objects(
+    offset: int, layer_data: list[tuple[str, Any]], n_layers: int
+) -> list[Any]:
+    """保存データからキャッシュオブジェクトを再構築する。
+
+    MLA (DeepSeek V4) 対応: tag == "mla" の場合は MLACacheState を返す。
+    """
     cache: list[Any] = []
     for tag, data in layer_data:
         if tag == "kv":
@@ -49,6 +56,8 @@ def _build_cache_objects(offset: int, layer_data: list[tuple[str, Any]], n_layer
             if data is not None:
                 ac.state = [mx.array(x) for x in data]
             cache.append(ac)
+        elif tag == "mla":
+            cache.append(_mla_state_from_dict(data))
     while len(cache) < n_layers:
         cache.append(ArraysCache(size=2))
     return cache
@@ -119,7 +128,8 @@ class KVCacheManager:
         candidates = [
             e
             for e in self._list_disk_entries()
-            if e.get("offset", 0) <= len(prompt_ids) and self._hash_prefix(prompt_ids, e["offset"]) == e.get("hash", "")
+            if e.get("offset", 0) <= len(prompt_ids)
+            and self._hash_prefix(prompt_ids, e["offset"]) == e.get("hash", "")
         ]
         candidates.sort(key=lambda e: e["offset"], reverse=True)
         for entry in candidates:
@@ -265,9 +275,13 @@ class KVCacheManager:
         layer_data: list[tuple[str, Any]] = []
         for i in range(num_layers):
             if i in kv_indices:
-                layer_data.append(("kv", (arrays[f"l{i}_keys"], arrays[f"l{i}_values"])))
+                layer_data.append(
+                    ("kv", (arrays[f"l{i}_keys"], arrays[f"l{i}_values"]))
+                )
             elif i in arr_indices:
-                layer_data.append(("arr", [arrays[f"l{i}_arr{j}"] for j in range(arr_indices[i])]))
+                layer_data.append(
+                    ("arr", [arrays[f"l{i}_arr{j}"] for j in range(arr_indices[i])])
+                )
             else:
                 layer_data.append(("arr", None))
         if all(tag == "arr" and d is None for tag, d in layer_data):
@@ -337,3 +351,197 @@ class KVCacheManager:
 
 
 kv_manager = KVCacheManager()
+
+
+# ======== MLA (DeepSeek V4) キャッシュ対応 ========
+
+
+class MLACacheState:
+    """1 層の DeepseekV4Attention の可変状態を保持する。"""
+
+    __slots__ = (
+        "ltype",
+        "win",
+        "comp_kvs",
+        "buf_kv",
+        "buf_gate",
+        "buf_idx",
+        "entry_count",
+        "idx_comp_kvs",
+        "idx_buf_kv",
+        "idx_buf_gate",
+        "idx_buf_pos",
+    )
+
+    def __init__(self, ltype: str):
+        self.ltype = ltype
+        self.win: mx.array | None = None
+        self.comp_kvs: mx.array | None = None
+        self.buf_kv: mx.array | None = None
+        self.buf_gate: mx.array | None = None
+        self.buf_idx: int = 0
+        self.entry_count: int = 0
+        self.idx_comp_kvs: mx.array | None = None
+        self.idx_buf_kv: mx.array | None = None
+        self.idx_buf_gate: mx.array | None = None
+        self.idx_buf_pos: int = 0
+
+
+def _mla_state_from_attn(attn) -> MLACacheState:
+    s = MLACacheState(attn.ltype)
+    s.win = attn.win
+    s.comp_kvs = attn.comp_kvs
+    s.buf_kv = getattr(attn, "buf_kv", None)
+    s.buf_gate = getattr(attn, "buf_gate", None)
+    s.buf_idx = attn.buf_idx
+    s.entry_count = attn.entry_count
+    s.idx_comp_kvs = getattr(attn, "idx_comp_kvs", None)
+    s.idx_buf_kv = getattr(attn, "idx_buf_kv", None)
+    s.idx_buf_gate = getattr(attn, "idx_buf_gate", None)
+    s.idx_buf_pos = getattr(attn, "idx_buf_pos", 0)
+    return s
+
+
+def _mla_apply_to_attn(attn, state: MLACacheState):
+    attn.win = state.win
+    attn.comp_kvs = state.comp_kvs
+    if state.buf_kv is not None:
+        attn.buf_kv = state.buf_kv
+        attn.buf_gate = state.buf_gate
+    attn.buf_idx = state.buf_idx
+    attn.entry_count = state.entry_count
+    if state.idx_comp_kvs is not None:
+        attn.idx_comp_kvs = state.idx_comp_kvs
+        attn.idx_buf_kv = state.idx_buf_kv
+        attn.idx_buf_gate = state.idx_buf_gate
+        attn.idx_buf_pos = state.idx_buf_pos
+
+
+def _mla_state_to_dict(state: MLACacheState) -> dict:
+    d: dict = {"ltype": state.ltype}
+    for k in (
+        "win",
+        "comp_kvs",
+        "buf_kv",
+        "buf_gate",
+        "idx_comp_kvs",
+        "idx_buf_kv",
+        "idx_buf_gate",
+    ):
+        v = getattr(state, k)
+        if v is not None:
+            d[k] = v
+    d["buf_idx"] = state.buf_idx
+    d["entry_count"] = state.entry_count
+    d["idx_buf_pos"] = state.idx_buf_pos
+    return d
+
+
+def _mla_state_from_dict(d: dict) -> MLACacheState:
+    s = MLACacheState(d["ltype"])
+    for k in (
+        "win",
+        "comp_kvs",
+        "buf_kv",
+        "buf_gate",
+        "idx_comp_kvs",
+        "idx_buf_kv",
+        "idx_buf_gate",
+    ):
+        v = d.get(k)
+        if v is not None:
+            setattr(s, k, v)
+    s.buf_idx = d.get("buf_idx", 0)
+    s.entry_count = d.get("entry_count", 0)
+    s.idx_buf_pos = d.get("idx_buf_pos", 0)
+    return s
+
+
+def snapshot_v4(model) -> list[tuple[str, Any]]:
+    snap: list[tuple[str, Any]] = []
+    for layer in model.layers:
+        snap.append(("mla", _mla_state_to_dict(_mla_state_from_attn(layer.attn))))
+    return snap
+
+
+def restore_v4(model, layer_data: list[tuple[str, Any]]):
+    for i, (tag, data) in enumerate(layer_data):
+        if tag == "mla" and i < len(model.layers):
+            _mla_apply_to_attn(model.layers[i].attn, _mla_state_from_dict(data))
+
+
+# ---- KVCacheManager のディスク保存/読込を MLA 対応に拡張 ----
+
+
+def _mla_disk_save(self, key, offset, layer_data, prompt_length):
+    try:
+        with self._disk_lock:
+            arrays: dict[str, mx.array] = {}
+            arr_map: dict[int, list[str]] = {}
+            for i, (tag, data) in enumerate(layer_data):
+                layer_arrs: list[str] = []
+                for k, v in data.items():
+                    if isinstance(v, mx.array):
+                        aname = f"l{i}_{k}"
+                        arrays[aname] = v
+                        layer_arrs.append(k)
+                arr_map[i] = layer_arrs
+            if arrays:
+                mx.save_safetensors(self._disk_path(key), arrays)
+            meta = {
+                "version": FORMAT_VERSION,
+                "hash": key,
+                "offset": offset,
+                "num_layers": len(layer_data),
+                "mla_indices": {str(i): arr_map[i] for i in range(len(layer_data))},
+                "prompt_tokens": prompt_length,
+                "created_at": time.time(),
+            }
+            with open(self._meta_path(key), "w") as f:
+                json.dump(meta, f)
+            self._cleanup_disk()
+    except Exception as e:
+        print(f"[KVC] mla disk save error: {e}", file=sys.stderr, flush=True)
+
+
+def _mla_disk_load(self, key, meta):
+    loaded = mx.load(self._disk_path(key))
+    arrays = loaded if isinstance(loaded, dict) else {}
+    mla_indices = {int(k): v for k, v in meta.get("mla_indices", {}).items()}
+    layer_data: list[tuple[str, Any]] = []
+    for i in range(meta["num_layers"]):
+        keys = mla_indices.get(i, [])
+        d: dict = {}
+        for k in keys:
+            aname = f"l{i}_{k}"
+            if aname in arrays:
+                d[k] = arrays[aname]
+        d["ltype"] = "sliding"
+        layer_data.append(("mla", d))
+    return layer_data
+
+
+_orig_disk_save = KVCacheManager._disk_save
+
+
+def _patched_disk_save(self, key, offset, layer_data, prompt_length):
+    if layer_data and layer_data[0][0] == "mla":
+        _mla_disk_save(self, key, offset, layer_data, prompt_length)
+    else:
+        _orig_disk_save(self, key, offset, layer_data, prompt_length)
+
+
+_orig_disk_load = KVCacheManager._disk_load_arrays
+
+
+def _patched_disk_load(self, key):
+    meta_path = self._meta_path(key)
+    with open(meta_path) as f:
+        meta = json.load(f)
+    if "mla_indices" in meta:
+        return _mla_disk_load(self, key, meta)
+    return _orig_disk_load(self, key)
+
+
+KVCacheManager._disk_save = _patched_disk_save
+KVCacheManager._disk_load_arrays = _patched_disk_load

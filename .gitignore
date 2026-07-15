@@ -23,3 +23,15 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# ベンチマーク（開発者向け、第三者は不要）
+elfmoon/bench/
+
+# 実験的実装（DeepSeek V4 Flash / VL 等。第三者は不要）
+elfmoon/hyper_connection.py
+elfmoon/integrate_v4.py
+elfmoon/mla_attention.py
+elfmoon/model_v4.py
+elfmoon/norm_rope_v4.py
+elfmoon/sparse_attention.py
+elfmoon/vision_encoder.py

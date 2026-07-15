@@ -68,9 +68,33 @@ class ExpertStore:
         mx.eval()
 
 
-def expert_ffn(x, w):
+def expert_ffn(x, w, group_size=GROUP, bits=BITS):
     """SwiGLU FFN を量子化重みで計算。x:[T, dim] → [T, dim]。"""
-    g = mx.quantized_matmul(x, w["gate.wq"], w["gate.s"], w["gate.b"], transpose=True, group_size=GROUP, bits=BITS)
-    u = mx.quantized_matmul(x, w["up.wq"], w["up.s"], w["up.b"], transpose=True, group_size=GROUP, bits=BITS)
+    g = mx.quantized_matmul(
+        x,
+        w["gate.wq"],
+        w["gate.s"],
+        w.get("gate.b"),
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+    )
+    u = mx.quantized_matmul(
+        x,
+        w["up.wq"],
+        w["up.s"],
+        w.get("up.b"),
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+    )
     h = (g * mx.sigmoid(g)) * u
-    return mx.quantized_matmul(h, w["down.wq"], w["down.s"], w["down.b"], transpose=True, group_size=GROUP, bits=BITS)
+    return mx.quantized_matmul(
+        h,
+        w["down.wq"],
+        w["down.s"],
+        w.get("down.b"),
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+    )
