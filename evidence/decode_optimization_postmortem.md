@@ -8,7 +8,7 @@
 
 | 試行 | 結果 | 要因 |
 |------|------|------|
-| 投機デコード (R≒4.75) | 不可 | 80B A3B の routing パターンが投機に不適合 |
+| 投機デコード (R≒4.75) | 不可 | compiled 単トークン decode が既に速く、group 検証パスが 4.75× コスト、tok/pass ~1.7 では相殺不能（35B 実測） |
 | Stage A: global LRU + mx.take | 0.66× FAIL | mx.take のコピーコストが mx.stack より大 |
 | Stage B: gather_qmm GSC + M2 | 0.55× FAIL | M2 fill で SSD I/O 大量発生、GSC 二重保持で OOM |
 | gather_qmm prefill | **成功 (3.5×)** | 融合テンソル mmap + gather_qmm で prefill が 3.5倍 |
@@ -23,26 +23,34 @@
 
 ### 本質的制約
 
-**decode の 1 step は 48 層 × top-10 の expert 重みを CPU-GPU 間で往復させる必要がある。** このバイト数（~4MB/step）を減らす機構はなく、gather/cache 再配置では帯域が減らない。帯域不足なら投機（accept 率不足）にも GSC（SSD I/O 増加）にも効かない。
+**decode の 1 step は active ~3B params（4-bit で ~1.5GB/token）の expert 重みを統一メモリから GPU が読む帯域に律速される。** このバイト数を減らす機構はなく、gather/cache 再配置では帯域が減らない。帯域不足なら投機（accept 率不足）にも GSC（SSD I/O 増加）にも効かない。
 
 80B decode ~10 t/s は streaming-expert 設計の実質的な床と考える。
 
-## 確定した成果（本番投入可能）
+## 成果サマリ（このキャンペーンの確定物）
 
-| 成果 | スピード | 備考 |
-|------|---------|------|
-| gather_qmm prefill (35B) | 3.5× | 融合テンソル mmap + gather_qmm。80B 展開 pending |
-| 投機デコード知見 | — | R≈4.75 不足の確認。routing パターン分析完了 |
-| GSC 知見 | — | gather_qmm + M2 が実経路で効かない確認。同種の試行を回避可能 |
-| 計測手法教訓 | — | 速度主張は実 stream_generate warm A/B 必須。micro/self-contained は誤導する |
+| 領域 | 状態 |
+|------|------|
+| prefill gather_qmm (35B) | ✅ **3.5×**（速度+パリティ確認済み） |
+| prefill gather_qmm (80B) | ⏳ 速度確認済み（3.5×相当）。**パリティ未検証** → §2 で取得後に完全確定 |
+| MCP / opencode tool_calls | ✅ 実動作確認済み |
+| decode | ⛔ **投機・GSC とも行き止まり。~10t/s(80B) は床。打ち止め済み** |
+| レバーB（融合永続化） | ⏸ **保留**: gather_qmm mmap で既に達成済み。cold TTFT 問題が顕在化した場合のみ再検討 |
+| 計測手法教訓 | ✅ 総括文書に誓約済み |
+
+### 確定知見
+
+- 投機デコード: compiled 単トークン decode が既に速く、group 検証パス 4.75× コスト、tok/pass ~1.7 では相殺不能（35B 実測）
+- GSC decode: gather_qmm + M2 が実経路 0.55× で効かない確認。同種の試行を回避可能
+- 速度主張は実 stream_generate warm A/B 必須（micro/self-contained は 3 回連続で誤導）
 
 ## 今後の方向性
 
-Claude #09 §6 の推奨に従い:
+Claude #09/#10 の推奨に従い:
 
-1. **prefill 側の 80B 展開**: gather_qmm prefill が 35B で 3.5× 確認済み。80B でも同等の効果が期待できる。優先度: 高。
-2. **レバーB（層ごと融合永続化）**: prefill で読んだ融合テンソルをチャンク間で使い回す。既に効くと分かっている方向。
-3. **decode 側は静的**: 現行の ResidentCache + stack + _decode_moe 経路を維持。新規最適化の試行は prefill 側に集中。
+1. **80B prefill logits パリティ取得**（§2）→ 確定後に本番投入
+2. ~~**レバーB（層ごと融合永続化）**:~~ → **保留**: cold TTFT が実ユーザーの問題として挙がった場合のみ再検討
+3. **decode 側は静的**: 現行経路維持。新規最適化の試行は行わない
 
 ## 計測手法の誓約
 
