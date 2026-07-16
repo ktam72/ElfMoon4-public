@@ -117,6 +117,13 @@ def main():
         _cfg = json.load(f)
     _model_type = _cfg.get("model_type", "")
 
+    _sampler_kwargs = {}
+    if _model_type == "gemma4":
+        TEMP = 1.0
+        _sampler_kwargs = dict(temp=TEMP, top_p=0.95, top_k=64)
+    else:
+        TEMP = 0.4
+
     mode = "性能" if perf else "省メモリ"
     print(f"モデル: {model_path}（type={_model_type}）")
     print(f"モデルをロード中...（{mode}モード, capacity={cap}）")
@@ -226,7 +233,7 @@ def main():
                 answer_t = time.perf_counter()
                 print(resp, end="", flush=True)
             else:
-                _sampler = make_sampler(temp=TEMP)
+                _sampler = make_sampler(**_sampler_kwargs)
                 _gen_kwargs = dict(
                     model=model,
                     tokenizer=tok,

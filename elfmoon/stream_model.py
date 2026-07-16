@@ -11,6 +11,7 @@ import mlx.nn as nn
 from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
 from expert_store import BITS, GROUP, ExpertStore
 from resident_cache import ResidentCache
+from slot_cache import GlobalSlotCache, _SENTINEL
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -172,6 +173,119 @@ def _decode_moe(
     return result
 
 
+def _decode_moe_gather(
+    x,
+    gsc,
+    layer,
+    slot_ids,
+    weights,
+    top_k,
+    shared=None,
+    group_size=GROUP,
+    bits=BITS,
+    mode="affine",
+):
+    """gather_qmm-based MoE decode using GlobalSlotCache 3D buffer.
+
+    All experts must be resident (slot_ids all valid). Uses 3 gather_qmm
+    calls (gate, up, down) — no explicit data copy, gather fused into matmul.
+
+    NOTE: DEAD END (directive_deepseek_09.md).
+    Real stream_generate path measured 0.55x vs baseline.
+    Kept for reference only. Do not use for new development.
+    """
+    xb = mx.expand_dims(x, (-2, -3))
+    rhs = slot_ids.astype(mx.uint32).reshape(1, -1)
+
+    g = mx.gather_qmm(
+        xb,
+        gsc.gate_wq,
+        gsc.gate_s,
+        gsc.gate_b,
+        rhs_indices=rhs,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    u = mx.gather_qmm(
+        xb,
+        gsc.up_wq,
+        gsc.up_s,
+        gsc.up_b,
+        rhs_indices=rhs,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    h = (g * mx.sigmoid(g)) * u
+    yo = mx.gather_qmm(
+        h,
+        gsc.down_wq,
+        gsc.down_s,
+        gsc.down_b,
+        rhs_indices=rhs,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    wg = weights.astype(yo.dtype).reshape(1, -1, 1)
+    result = (yo[:, :, 0, :] * wg).sum(1)
+    if shared is not None:
+        result = result + _shared_ffn(x, shared, group_size, bits, mode)
+    return result
+
+
+def _shared_ffn(x, shared, group_size, bits, mode):
+    gated = len(shared) == 11
+    if gated:
+        (
+            sg_w,
+            sg_s,
+            sg_b,
+            sg_bits,
+            sg_gs,
+            se_guw,
+            se_gus,
+            se_gub,
+            se_dw,
+            se_ds,
+            se_db,
+        ) = shared
+    else:
+        se_guw, se_gus, se_gub, se_dw, se_ds, se_db = shared
+    se_gu = mx.quantized_matmul(
+        x,
+        se_guw,
+        se_gus,
+        se_gub,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    se_g, se_u = se_gu[:, : se_gu.shape[-1] // 2], se_gu[:, se_gu.shape[-1] // 2 :]
+    se_h = (se_g * mx.sigmoid(se_g)) * se_u
+    se_out = mx.quantized_matmul(
+        se_h,
+        se_dw,
+        se_ds,
+        se_db,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    if gated:
+        sg = mx.quantized_matmul(
+            x, sg_w, sg_s, sg_b, transpose=True, group_size=sg_gs, bits=sg_bits
+        )
+        return mx.sigmoid(sg) * se_out
+    return se_out
+
+
 # ---- B: プレフィル(N>1) 用 融合テンソル mmap + gather_qmm ----
 
 
@@ -213,9 +327,7 @@ class FusedPrefillStore:
         out = {}
         for sh in shards:
             data = mx.load(os.path.join(self._model_path, sh))
-            out.update(
-                {k: data[v] for k, v in keys.items() if self._wm[v] == sh}
-            )
+            out.update({k: data[v] for k, v in keys.items() if self._wm[v] == sh})
         return out
 
 
@@ -282,6 +394,7 @@ class StreamingMoE(nn.Module):
         mode="affine",
         fused_store=None,
         is_last_moe=False,
+        gsc=None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -290,6 +403,7 @@ class StreamingMoE(nn.Module):
         self.top_k = top_k
         self._store = store
         self._cache = cache
+        self._gsc = gsc
         self._fused_store = fused_store
         self._is_last_moe = is_last_moe
         self.norm = norm
@@ -357,6 +471,36 @@ class StreamingMoE(nn.Module):
             )
 
         if N == 1:
+            gsc = self._gsc
+            if gsc is not None:
+                # M2 path: fill misses, then ALWAYS run gather_qmm
+                mx.eval(idx, w)
+                idx_l = idx.tolist()[0]
+
+                miss_ids = [e for e in idx_l if (self.layer_idx, e) not in gsc._lru]
+                if miss_ids:
+                    gsc.get_slots(self.layer_idx, miss_ids)
+
+                # GPU slot_ids (all valid after fill)
+                slot_ids = mx.take(
+                    gsc.slot_map[self.layer_idx], idx[0].astype(mx.uint32)
+                ).astype(mx.uint32)
+                weights_gpu = w[0].astype(mx.float16)
+                result = _decode_moe_gather(
+                    xf[0:1],
+                    gsc,
+                    self.layer_idx,
+                    slot_ids,
+                    weights_gpu,
+                    self.top_k,
+                    shared=self._shared,
+                    group_size=self.group_size,
+                    bits=self.bits,
+                    mode=self.mode,
+                ).reshape(shp)
+                return result.astype(x.dtype)
+
+            # Non-GSC path: existing stack + _decode_moe
             mx.eval(idx, w)
             idx_l = idx.tolist()
             experts = [load(e) for e in idx_l[0]]
@@ -611,6 +755,27 @@ def wire_streaming(
             f"未対応のmoe_router_activation_func: {activation!r}（softmax/sigmoid/sqrtsoftplusのみ対応）"
         )
     store = ExpertStore(store_dir or STORE_DIR)
+    gsc = None
+    gsc_ne = int(os.environ.get("SSC", "0"))
+    if gsc_ne > 0:
+        init_layers = list(
+            getattr(model, "layers", None)
+            or getattr(model.model, "layers", None)
+            or getattr(model.language_model, "layers", None)
+            or []
+        )
+        try:
+            cfg = json.load(open(os.path.join(model_path or MODEL_PATH, "config.json")))
+            tc = cfg.get("text_config", cfg)
+            d = tc.get("hidden_size", 2048)
+            i = tc.get("intermediate_size", 512)
+        except Exception:
+            d, i = 2048, 512
+        gsc = GlobalSlotCache(gsc_ne, store, n_layers=len(init_layers), dim=d, inter=i)
+        pe = store.per_expert_bytes() / (1024 * 1024)
+        print(
+            f"  GlobalSlotCache: {gsc_ne}slots x {len(init_layers)}layers (~{gsc_ne * pe / 1024:.1f}GB)"
+        )
     if perf:
         eff_cap = max(capacity, 8000)
         cache = ResidentCache(eff_cap)
@@ -628,7 +793,9 @@ def wire_streaming(
     fused_store = None
     try:
         fused_store = FusedPrefillStore(model_path or MODEL_PATH)
-        print(f"  プレフィル: gather_qmm 高速経路（融合テンソル {len(fused_store._layer_keys)}層）")
+        print(
+            f"  プレフィル: gather_qmm 高速経路（融合テンソル {len(fused_store._layer_keys)}層）"
+        )
     except Exception as e:
         print(f"  プレフィル: per-expert 経路（融合テンソル読込不可: {e}）")
     layers = (
@@ -661,6 +828,7 @@ def wire_streaming(
                 routing_scale=routing_scale,
                 norm=mlp.norm_topk_prob,
                 fused_store=fused_store,
+                gsc=gsc,
             )
         elif hasattr(mlp, "switch_mlp"):
             n_exp = mlp.switch_mlp.gate_proj.weight.shape[0]
@@ -683,6 +851,7 @@ def wire_streaming(
                 correction_bias=correction_bias,
                 routing_scale=routing_scale,
                 fused_store=fused_store,
+                gsc=gsc,
             )
         else:
             n_dense += 1

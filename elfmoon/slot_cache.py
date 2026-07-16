@@ -84,7 +84,9 @@ class SlotResidentCache:
                 slot = self._lru.pop(key)
                 del self._layer_maps[l][e]
                 return slot
-        raise RuntimeError(f"layer {layer}: 退避可能スロットなし（per_layer={self.per_layer}, in_use={len(in_use)}）")
+        raise RuntimeError(
+            f"layer {layer}: 退避可能スロットなし（per_layer={self.per_layer}, in_use={len(in_use)}）"
+        )
 
     def get_slots(self, layer, expert_ids):
         """expert_ids (list[int]) に対応するスロット番号のリストを返す。"""
@@ -128,7 +130,9 @@ class SlotResidentCache:
         layer, expert = key
         slots = self.get_slots(layer, [expert])
         slot = slots[0]
-        return {name: getattr(self, _buf_name(name))[layer][slot] for name in EXPERT_SHAPES}
+        return {
+            name: getattr(self, _buf_name(name))[layer][slot] for name in EXPERT_SHAPES
+        }
 
     def prime(self, layer, expert):
         key = (layer, expert)
@@ -156,7 +160,168 @@ class SlotResidentCache:
         return {
             "hits": self.hits,
             "misses": self.misses,
-            "hit_rate": self.hits / (self.hits + self.misses) if (self.hits + self.misses) else 0.0,
+            "hit_rate": self.hits / (self.hits + self.misses)
+            if (self.hits + self.misses)
+            else 0.0,
             "resident": len(self._lru),
             "capacity": self.n_layers * self.per_layer,
+        }
+
+
+# ---- Global LRU mode (decode GPU-hit-path) ----
+# [DEAD END] directive_deepseek_09.md: 実stream_generate経路で0.55x。
+# GSC decode 方向は行き止まり。SSC=0 (既定) で無効のため既定挙動は無害。
+# 履歴として維持（envフラグ付き）、新規開発では使わないこと。
+
+
+_N_EXPERTS = 512
+_SENTINEL = 0xFFFF
+
+
+class GlobalSlotCache:
+    """Single global 3D buffer + global LRU + GPU slot_map.
+
+    Used by decode GPU-hit-path (Phase 2). All layers share one capacity-sized
+    3D buffer, evicted by global LRU. Maintains a GPU-resident slot_map array
+    for GPU-side expert→slot resolution (no CPU round-trip on hit).
+    """
+
+    def __init__(
+        self, capacity, store, n_layers=48, n_experts=512, dim=DIM, inter=INTER
+    ):
+        self.capacity = capacity
+        self.n_layers = n_layers
+        self.n_experts = n_experts
+        self._store = store
+        _dim = dim
+        _inter = inter
+        self._lru = OrderedDict()
+        self._free = list(range(capacity - 1, -1, -1))
+        self._layer_maps = [{} for _ in range(n_layers)]
+        self.hits = 0
+        self.misses = 0
+
+        # Global 3D buffers [capacity, ...]
+        # All non-wq buffers use float32 to match ExpertStore precision.
+        self.gate_wq = mx.zeros((capacity, _inter, _dim // 8), dtype=mx.uint32)
+        self.gate_s = mx.zeros((capacity, _inter, _dim // GROUP), dtype=mx.float32)
+        self.gate_b = mx.zeros((capacity, _inter, _dim // GROUP), dtype=mx.float32)
+        self.up_wq = mx.zeros((capacity, _inter, _dim // 8), dtype=mx.uint32)
+        self.up_s = mx.zeros((capacity, _inter, _dim // GROUP), dtype=mx.float32)
+        self.up_b = mx.zeros((capacity, _inter, _dim // GROUP), dtype=mx.float32)
+        self.down_wq = mx.zeros((capacity, _dim, _inter // 8), dtype=mx.uint32)
+        self.down_s = mx.zeros((capacity, _dim, _inter // GROUP), dtype=mx.float32)
+        self.down_b = mx.zeros((capacity, _dim, _inter // GROUP), dtype=mx.float32)
+
+        # GPU slot_map: [n_layers, n_experts] → uint16
+        # CPU-side shadow for mutation (MLX arrays are immutable at element level)
+        self._slot_map_cpu = [[_SENTINEL] * n_experts for _ in range(n_layers)]
+        self.slot_map = mx.full((n_layers, n_experts), _SENTINEL, dtype=mx.uint16)
+
+    def _write_slot(self, slot, w):
+        buf_start = slot * 1
+        buf_end = slot + 1
+        self.gate_wq[slot : slot + 1] = w["gate.wq"].reshape(1, *w["gate.wq"].shape)
+        self.gate_s[slot : slot + 1] = w["gate.s"].reshape(1, *w["gate.s"].shape)
+        self.gate_b[slot : slot + 1] = w["gate.b"].reshape(1, *w["gate.b"].shape)
+        self.up_wq[slot : slot + 1] = w["up.wq"].reshape(1, *w["up.wq"].shape)
+        self.up_s[slot : slot + 1] = w["up.s"].reshape(1, *w["up.s"].shape)
+        self.up_b[slot : slot + 1] = w["up.b"].reshape(1, *w["up.b"].shape)
+        self.down_wq[slot : slot + 1] = w["down.wq"].reshape(1, *w["down.wq"].shape)
+        self.down_s[slot : slot + 1] = w["down.s"].reshape(1, *w["down.s"].shape)
+        self.down_b[slot : slot + 1] = w["down.b"].reshape(1, *w["down.b"].shape)
+
+    def _sync_slot_map(self, updated):
+        """Rebuild GPU slot_map rows that changed."""
+        for layer in updated:
+            row = mx.array(self._slot_map_cpu[layer], dtype=mx.uint16)
+            self.slot_map[layer : layer + 1] = row.reshape(1, -1)
+
+    def get_slots(self, layer, expert_ids):
+        """Returns list of slot indices for given expert IDs.
+
+        On hit: returns slot index from LRU, updates LRU order.
+        On miss: loads from store, writes to free/evicted slot, updates slot_map.
+        """
+        result = []
+        miss_ids = []
+        for eid in expert_ids:
+            key = (layer, eid)
+            if key in self._lru:
+                self.hits += 1
+                self._lru.move_to_end(key)
+                result.append(self._lru[key])
+            else:
+                self.misses += 1
+                miss_ids.append(eid)
+                result.append(None)
+
+        if not miss_ids:
+            return result
+
+        in_use = {(layer, eid) for eid in expert_ids}
+        dirty_layers = set()
+        for eid in miss_ids:
+            if self._free:
+                slot = self._free.pop()
+            else:
+                evict_key, slot = self._lru.popitem(last=False)
+                ev_layer, ev_expert = evict_key
+                del self._layer_maps[ev_layer][ev_expert]
+                self._slot_map_cpu[ev_layer][ev_expert] = _SENTINEL
+                dirty_layers.add(ev_layer)
+            w = self._store.load(layer, eid)
+            self._write_slot(slot, w)
+            self._lru[(layer, eid)] = slot
+            self._layer_maps[layer][eid] = slot
+            self._slot_map_cpu[layer][eid] = slot
+            dirty_layers.add(layer)
+            idx = expert_ids.index(eid)
+            result[idx] = slot
+
+        if dirty_layers:
+            self._sync_slot_map(dirty_layers)
+
+        mx.eval(
+            self.gate_wq,
+            self.gate_s,
+            self.gate_b,
+            self.up_wq,
+            self.up_s,
+            self.up_b,
+            self.down_wq,
+            self.down_s,
+            self.down_b,
+            self.slot_map,
+        )
+        return result
+
+    def get_gather_bufs(self):
+        """Returns (gate_wq, gate_s, gate_b, up_wq, up_s, up_b, down_wq, down_s, down_b)
+        as global 3D arrays for gather_qmm."""
+        return (
+            self.gate_wq,
+            self.gate_s,
+            self.gate_b,
+            self.up_wq,
+            self.up_s,
+            self.up_b,
+            self.down_wq,
+            self.down_s,
+            self.down_b,
+        )
+
+    @property
+    def hit_rate(self):
+        t = self.hits + self.misses
+        return self.hits / t if t else 0.0
+
+    def stats(self):
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": self.hit_rate,
+            "resident": len(self._lru),
+            "capacity": self.capacity,
+            "slot_map_dtype": str(self.slot_map.dtype),
         }
