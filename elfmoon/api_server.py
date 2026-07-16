@@ -113,6 +113,10 @@ TOOL_CALL_END = "<tool_call|>"
 _TC_START = re.escape(TOOL_CALL_START)
 _TC_END = re.escape(TOOL_CALL_END)
 
+# 開始マーカーは実モデルで <|tool_call> と <|tool_call|> の両形が観測されるため、
+# 末尾 | を任意にした正規表現で許容する（片側欠けによる抽出漏れを防ぐ）。
+_TC_START_RE = re.compile(r"<\|tool_call\|?>")
+
 
 def _match_brace(text: str, pos: int) -> int:
     """text[pos] が '{' の場合、対応する '}' の位置+1 を返す。"""
@@ -261,6 +265,25 @@ def _clean_token_artifacts(text: str) -> str:
     return text
 
 
+def _strip_channels(text: str) -> str:
+    """gemma のチャンネル形式 <|channel>NAME...<channel|>CONTENT を除去する。
+
+    モデルの chat_template 自身の除去ロジックに準拠:
+      text を <channel|> で分割し、<|channel> を含む part は <|channel> より前だけ残す。
+    これで思考チャンネル（<|channel>thought...）とマーカーが消え、最終回答のみ残る。
+    チャンネルマーカーを含まないテキスト（Qwen 等）は素通し。
+    """
+    if "<|channel>" not in text and "<channel|>" not in text:
+        return text
+    result = []
+    for part in text.split("<channel|>"):
+        if "<|channel>" in part:
+            result.append(part.split("<|channel>")[0])
+        else:
+            result.append(part)
+    return "".join(result)
+
+
 def _extract_tool_calls(text: str) -> tuple[str, list[dict]]:
     """テキストから tool_call ブロックを抽出し、(マーカー除去済みテキスト, tool_call リスト) を返す。"""
     calls = []
@@ -268,15 +291,16 @@ def _extract_tool_calls(text: str) -> tuple[str, list[dict]]:
     i = 0
 
     while i < len(text):
-        # 次の <|tool_call|> を探す
-        start = text.find(TOOL_CALL_START, i)
-        if start == -1:
+        # 次の開始マーカー（<|tool_call> / <|tool_call|>）を探す
+        m = _TC_START_RE.search(text, i)
+        if m is None:
             cleaned_parts.append(text[i:])
             break
+        start = m.start()
 
         # 開始マーカー以前のテキストを保存
         cleaned_parts.append(text[i:start])
-        content_start = start + len(TOOL_CALL_START)
+        content_start = m.end()
 
         # <tool_call|> 終了マーカーを探す
         end = text.find(TOOL_CALL_END, content_start)
@@ -303,7 +327,8 @@ def _extract_tool_calls(text: str) -> tuple[str, list[dict]]:
                     "type": "function",
                     "function": {"name": name, "arguments": json.dumps(args)},
                 }
-                call_end = close
+                # call_end は END マーカーの後（line 293）を維持する。close（}位置）で
+                # 上書きすると <tool_call|> が cleaned テキストに残ってしまう。
 
         # OpenAI JSON 形式: {"name":..., "arguments":...}
         if parsed is None:
@@ -328,7 +353,7 @@ def _extract_tool_calls(text: str) -> tuple[str, list[dict]]:
                             "type": "function",
                             "function": {"name": name, "arguments": json.dumps(args)},
                         }
-                        call_end = close
+                        # call_end は END マーカーの後（line 293）を維持
                     except (json.JSONDecodeError, TypeError):
                         pass
 
@@ -721,54 +746,39 @@ class GenerationEngine:
 
             if tools:
                 clean_text, tool_calls = _extract_tool_calls(output_text)
+                if not tool_calls and "tool_call" in output_text.lower():
+                    # 抽出失敗（マーカー不一致の兆候）を可視化して調整を容易にする
+                    print(
+                        f"[ENGINE] ⚠️ tool_call らしき出力を抽出できず（マーカー要確認）: "
+                        f"{output_text[:240]!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             else:
                 clean_text = output_text
                 tool_calls = []
 
             if not tool_calls:
-                detokenizer = tokenizer.detokenizer
-                detokenizer.reset()
-                stripper = ThinkStripper() if no_think else None
-                n = 0
-                for token in output_ids:
-                    detokenizer.add_token(token)
-                    piece = detokenizer.last_segment
-                    if not piece:
-                        continue
-                    n += 1
-                    if stripper is not None:
-                        piece = stripper.feed(piece)
-                        if piece is None:
-                            continue
-                    yield (piece, n)
-                if stripper is not None and stripper.pending:
-                    yield (stripper.pending, n)
+                # 生成は既に完了しているので全文をクリーニングして返す。
+                # detokenizer を逐次に流すとチャンネルマーカーや token artifact が
+                # 除去されず漏れる（これが <|channel>thought<channel|> 漏れの原因）。
+                text_out = _strip_channels(output_text)
+                if no_think:
+                    stripper = ThinkStripper()
+                    out = stripper.feed(text_out)
+                    text_out = (out or "") + stripper.pending
+                if text_out:
+                    yield (text_out, len(output_ids))
                 return
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": clean_text or None,
-                    "tool_calls": tool_calls,
-                }
-            )
-
-            for tc in tool_calls:
-                try:
-                    name = tc["function"]["name"]
-                    args = json.loads(tc["function"]["arguments"])
-                    result = mcp_manager.call_tool(name, args)
-                except Exception as call_err:
-                    result = f"Error: {call_err}"
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": str(result),
-                    }
-                )
-
-            round_idx += 1
+            # ① クライアント側ツール実行方式: サーバーでは実行せず tool_calls を返して終了。
+            # opencode 等の OpenAI 互換クライアントが自分でツールを実行し、結果を
+            # 次リクエストの role:tool メッセージとして送り返す（標準の function-calling）。
+            yield {
+                "tool_calls": tool_calls,
+                "content": _strip_channels(clean_text or "") or None,
+            }
+            return
 
 
 # ---- HTTP ----
@@ -1040,10 +1050,57 @@ class APIHandler(BaseHTTPRequestHandler):
             no_think=NO_THINK,
             tools=tools,
         )
+        finish_reason = "stop"
         try:
             for msg in gen:
                 if isinstance(msg, int):
                     prompt_tokens = msg
+                    continue
+                if isinstance(msg, dict) and "tool_calls" in msg:
+                    # ① tool_calls を OpenAI ストリーミング形式の delta で返す（サーバー実行しない）
+                    ctext = msg.get("content") or ""
+                    if ctext:
+                        self._sse(
+                            json.dumps(
+                                {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": MODEL_ID,
+                                    "choices": [
+                                        {"index": 0, "delta": {"content": ctext}, "finish_reason": None}
+                                    ],
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+                    tc_delta = [
+                        {
+                            "index": i,
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            },
+                        }
+                        for i, tc in enumerate(msg["tool_calls"])
+                    ]
+                    self._sse(
+                        json.dumps(
+                            {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": MODEL_ID,
+                                "choices": [
+                                    {"index": 0, "delta": {"tool_calls": tc_delta}, "finish_reason": None}
+                                ],
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    finish_reason = "tool_calls"
                     continue
                 piece, n = msg
                 chunk = {
@@ -1082,7 +1139,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "object": "chat.completion.chunk",
             "created": created,
             "model": MODEL_ID,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": total,
@@ -1112,10 +1169,16 @@ class APIHandler(BaseHTTPRequestHandler):
             no_think=NO_THINK,
             tools=tools,
         )
+        tool_calls = None
+        tc_content = ""
         try:
             for msg in gen:
                 if isinstance(msg, int):
                     prompt_tokens = msg
+                    continue
+                if isinstance(msg, dict) and "tool_calls" in msg:
+                    tool_calls = msg["tool_calls"]
+                    tc_content = msg.get("content") or ""
                     continue
                 piece, n = msg
                 pieces.append(piece)
@@ -1126,12 +1189,22 @@ class APIHandler(BaseHTTPRequestHandler):
                 500, {"error": "generation_error", "message": str(e)}
             )
 
-        text = "".join(pieces)
         print(
-            f"[API] generate tools done in {time.time() - t0:.3f}s",
+            f"[API] generate tools done in {time.time() - t0:.3f}s"
+            f" tool_calls={len(tool_calls) if tool_calls else 0}",
             file=sys.stderr,
             flush=True,
         )
+        if tool_calls:
+            message = {
+                "role": "assistant",
+                "content": tc_content or None,
+                "tool_calls": tool_calls,
+            }
+            finish_reason = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": "".join(pieces)}
+            finish_reason = "stop"
         resp = {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
@@ -1140,8 +1213,8 @@ class APIHandler(BaseHTTPRequestHandler):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": {
