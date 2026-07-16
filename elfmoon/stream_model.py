@@ -8,6 +8,7 @@ import time
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
 from expert_store import BITS, GROUP, ExpertStore
 from resident_cache import ResidentCache
 
@@ -17,6 +18,10 @@ DEFAULT_MODEL_NAME = "qwen3.6-35b-mlx"
 
 # モデル置き場のルート。任意ディレクトリ（外部SSD等）を指せる唯一の結合点。
 MODELS_ROOT = os.environ.get("ELFMOON_MODELS_ROOT", os.path.join(_HERE, "..", "models"))
+
+# gather_qmm 高速プレフィルを使う最小チャンクトークン数。これ未満は per-expert 経路
+# （ResidentCache が効き短チャンクで有利）。実測: 2048 で互角、4096 で fused 3.4倍。
+FUSED_MIN_TOKENS = int(os.environ.get("ELFMOON_FUSED_MIN_TOKENS", "2048"))
 
 
 def resolve_model(name=None):
@@ -167,6 +172,91 @@ def _decode_moe(
     return result
 
 
+# ---- B: プレフィル(N>1) 用 融合テンソル mmap + gather_qmm ----
+
+
+class FusedPrefillStore:
+    """元モデル safetensors の融合 expert テンソル（[n_experts,...]）への mmap アクセス。
+
+    integrate.py が分解する前の `switch_mlp.{gate,up,down}_proj.{weight,scales,biases}`
+    をプレフィル専用に直接読む。per-expert の stack を不要にし gather_qmm へ直行できる。
+    層の dict は保持しない（materialize された融合テンソル ~450MB/層 が40層で
+    18GB 蓄積するのを防ぐ）。warm 時の再読込は OS のページキャッシュが担保する。
+    """
+
+    def __init__(self, model_path):
+        idx_path = os.path.join(model_path, "model.safetensors.index.json")
+        wm = json.load(open(idx_path))["weight_map"]
+        self._model_path = model_path
+        self._layer_keys = {}  # layer -> {"gate.wq": full_key, ...}
+        for k in wm:
+            if ".mlp.switch_mlp.gate_proj.weight" not in k:
+                continue
+            l = int(k.split(".layers.")[1].split(".")[0])
+            base = k.rsplit(".gate_proj.weight", 1)[0]
+            keys = {}
+            for p in ("gate", "up", "down"):
+                for t, suf in (("wq", "weight"), ("s", "scales"), ("b", "biases")):
+                    keys[f"{p}.{t}"] = f"{base}.{p}_proj.{suf}"
+            self._layer_keys[l] = keys
+        self._wm = wm
+        if not self._layer_keys:
+            raise ValueError(f"融合 switch_mlp キーが見つからない: {idx_path}")
+
+    def __contains__(self, layer):
+        return layer in self._layer_keys
+
+    def load(self, layer):
+        """層の融合テンソル dict（lazy mmap 参照）を返す。呼び出し側は保持しないこと。"""
+        keys = self._layer_keys[layer]
+        shards = {self._wm[v] for v in keys.values()}
+        out = {}
+        for sh in shards:
+            data = mx.load(os.path.join(self._model_path, sh))
+            out.update(
+                {k: data[v] for k, v in keys.items() if self._wm[v] == sh}
+            )
+        return out
+
+
+def _prefill_moe_gather(xf, idx, w, fused, group_size, bits, mode):
+    """融合テンソル（全 expert stack 済み）に対して gather_qmm で MoE を一括計算。
+
+    per-expert の Python ループ（expert_groups 構築・top_k×n_experts 個の小 matmul
+    dispatch・tolist 同期）を、expert 順ソート付きの 3 カーネルに置き換える。
+    数値は per-expert 経路と bf16 丸め差（~1e-3）で一致。
+    """
+    x = mx.expand_dims(xf, (-2, -3))  # [N,1,1,DIM]
+    do_sort = idx.size >= 64
+    if do_sort:
+        xs, ii, inv = _gather_sort(x, idx)  # expert 連続アクセスのためソート
+    else:
+        xs, ii, inv = x, idx, None
+
+    def gq(xin, p):
+        return mx.gather_qmm(
+            xin,
+            fused[f"{p}.wq"],
+            fused[f"{p}.s"],
+            fused[f"{p}.b"],
+            rhs_indices=ii,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            sorted_indices=do_sort,
+        )
+
+    g = gq(xs, "gate")
+    u = gq(xs, "up")
+    h = (g * mx.sigmoid(g)) * u
+    yo = gq(h, "down")
+    if do_sort:
+        yo = _scatter_unsort(yo, inv, idx.shape)  # [N, top_k, 1, DIM]
+    yo = yo.squeeze(-2)  # [N, top_k, DIM]
+    return (yo * w[:, :, None].astype(yo.dtype)).sum(axis=1)  # [N, DIM]
+
+
 # ---- Streaming MoE（MoE 層差し替え） ----
 
 
@@ -190,6 +280,8 @@ class StreamingMoE(nn.Module):
         group_size=GROUP,
         bits=BITS,
         mode="affine",
+        fused_store=None,
+        is_last_moe=False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -198,6 +290,8 @@ class StreamingMoE(nn.Module):
         self.top_k = top_k
         self._store = store
         self._cache = cache
+        self._fused_store = fused_store
+        self._is_last_moe = is_last_moe
         self.norm = norm
         self.activation = activation
         self.correction_bias = correction_bias
@@ -255,8 +349,6 @@ class StreamingMoE(nn.Module):
             w = w / mx.sum(w, axis=-1, keepdims=True)
         if self.routing_scale != 1.0:
             w = w * self.routing_scale
-        mx.eval(idx, w)
-        idx_l = idx.tolist()
         N = xf.shape[0]
 
         def load(e):
@@ -265,6 +357,8 @@ class StreamingMoE(nn.Module):
             )
 
         if N == 1:
+            mx.eval(idx, w)
+            idx_l = idx.tolist()
             experts = [load(e) for e in idx_l[0]]
 
             w_gu = mx.stack(
@@ -307,7 +401,34 @@ class StreamingMoE(nn.Module):
             ).reshape(shp)
             return result.astype(x.dtype)
 
-        # --- プレフィル(N>1): Expert単位でトークンをバッチ処理 ---
+        # --- プレフィル(N>1) 高速経路: 融合テンソル mmap + gather_qmm ---
+        # per-expert ループの Python dispatch（プレフィル時間の~78%）を3カーネルに
+        # 集約する。融合テンソル読込は ~450MB/層 の固定費のため、長チャンクのみ有効
+        # （短チャンクは ResidentCache が効く per-expert 経路が有利。実測の損益分岐:
+        # N=2048 でほぼ互角、N=4096 で fused が3.4倍）。読めないモデルはフォールバック。
+        fs = self._fused_store
+        if fs is not None and N >= FUSED_MIN_TOKENS and self.layer_idx in fs:
+            fused = fs.load(self.layer_idx)
+            out = _prefill_moe_gather(
+                xf, idx, w, fused, self.group_size, self.bits, self.mode
+            )
+            out = out.reshape(shp)
+            out = self._add_shared(out, xf)
+            # 融合テンソル(~450MB/層)の materialize を定期的に確定して解放する。
+            # 全40層を遅延すると18GB蓄積する。async_eval は CPU をブロックせず
+            # GPU 実行を開始させるので、次層のロードと計算がオーバーラップする。
+            if self.layer_idx % 4 == 3:
+                mx.async_eval(out)
+            if self._is_last_moe:
+                # プレフィルで使った融合テンソルのバッファ(~18GB)をプールに残すと
+                # decode 時のメモリ圧で速度が落ちる（実測 23→17 t/s）ため即返却する
+                mx.eval(out)
+                mx.clear_cache()
+            return out.astype(x.dtype)
+
+        # --- プレフィル(N>1) フォールバック: Expert単位でトークンをバッチ処理 ---
+        mx.eval(idx, w)
+        idx_l = idx.tolist()
         w_l = w.tolist()
         expert_groups = {}
         for t in range(N):
@@ -361,55 +482,60 @@ class StreamingMoE(nn.Module):
             contrib = yo * weights[:, None].astype(yo.dtype)
             out = out.at[indices].add(contrib)
         out = out.reshape(shp)
-        if self._shared is not None:
-            gated = len(self._shared) == 11
-            if gated:
-                (
-                    sg_w,
-                    sg_s,
-                    sg_b,
-                    sg_bits,
-                    sg_gs,
-                    se_gu_w,
-                    se_gu_s,
-                    se_gu_b,
-                    se_dw,
-                    se_ds,
-                    se_db,
-                ) = self._shared
-            else:
-                (
-                    se_gu_w,
-                    se_gu_s,
-                    se_gu_b,
-                    se_dw,
-                    se_ds,
-                    se_db,
-                ) = self._shared
-            se_h = mx.quantized_matmul(
-                xf,
+        out = self._add_shared(out, xf)
+        return out.astype(x.dtype)
+
+    def _add_shared(self, out, xf):
+        """shared expert の寄与を out に加算する（N>1 の両経路で共用）。"""
+        if self._shared is None:
+            return out
+        gated = len(self._shared) == 11
+        if gated:
+            (
+                sg_w,
+                sg_s,
+                sg_b,
+                sg_bits,
+                sg_gs,
                 se_gu_w,
                 se_gu_s,
                 se_gu_b,
-                transpose=True,
-                group_size=GROUP,
-                bits=BITS,
+                se_dw,
+                se_ds,
+                se_db,
+            ) = self._shared
+        else:
+            (
+                se_gu_w,
+                se_gu_s,
+                se_gu_b,
+                se_dw,
+                se_ds,
+                se_db,
+            ) = self._shared
+        se_h = mx.quantized_matmul(
+            xf,
+            se_gu_w,
+            se_gu_s,
+            se_gu_b,
+            transpose=True,
+            group_size=GROUP,
+            bits=BITS,
+        )
+        k2 = se_h.shape[-1] // 2
+        se_g, se_u = se_h[..., :k2], se_h[..., k2:]
+        se_gated = se_g * mx.sigmoid(se_g)
+        se_act = se_gated * se_u
+        se_out = mx.quantized_matmul(
+            se_act, se_dw, se_ds, se_db, transpose=True, group_size=GROUP, bits=BITS
+        )
+        se_out = se_out.reshape(out.shape)
+        if gated:
+            sg = mx.quantized_matmul(
+                xf, sg_w, sg_s, sg_b, transpose=True, group_size=sg_gs, bits=sg_bits
             )
-            k2 = se_h.shape[-1] // 2
-            se_g, se_u = se_h[..., :k2], se_h[..., k2:]
-            se_gated = se_g * mx.sigmoid(se_g)
-            se_act = se_gated * se_u
-            se_out = mx.quantized_matmul(
-                se_act, se_dw, se_ds, se_db, transpose=True, group_size=GROUP, bits=BITS
-            )
-            if gated:
-                sg = mx.quantized_matmul(
-                    xf, sg_w, sg_s, sg_b, transpose=True, group_size=sg_gs, bits=sg_bits
-                )
-                out = out + mx.sigmoid(sg) * se_out
-            else:
-                out = out + se_out
-        return out.astype(x.dtype)
+            return out + mx.sigmoid(sg).reshape(*out.shape[:-1], 1) * se_out
+        return out + se_out
 
 
 # ---- Wiring ----
@@ -498,12 +624,20 @@ def wire_streaming(
         print(
             f"  省メモリモード: 実効容量 {s['capacity']}（{s['capacity'] * 1.69 / 1000:.1f}GB）"
         )
+    # プレフィル高速化: 元モデルの融合テンソルを mmap 直読みする（読めなければ従来経路）
+    fused_store = None
+    try:
+        fused_store = FusedPrefillStore(model_path or MODEL_PATH)
+        print(f"  プレフィル: gather_qmm 高速経路（融合テンソル {len(fused_store._layer_keys)}層）")
+    except Exception as e:
+        print(f"  プレフィル: per-expert 経路（融合テンソル読込不可: {e}）")
     layers = (
         getattr(model, "layers", None)
         or getattr(model.model, "layers", None)
         or getattr(model.language_model, "layers", None)
     )
     n_dense = 0
+    last_moe = None
     for l, layer in enumerate(layers):
         mlp = layer.mlp
         # Qwen MoE: mlp が直接 num_experts と gate を持つ（switch_mlp なし）
@@ -526,6 +660,7 @@ def wire_streaming(
                 correction_bias=correction_bias,
                 routing_scale=routing_scale,
                 norm=mlp.norm_topk_prob,
+                fused_store=fused_store,
             )
         elif hasattr(mlp, "switch_mlp"):
             n_exp = mlp.switch_mlp.gate_proj.weight.shape[0]
@@ -547,10 +682,15 @@ def wire_streaming(
                 activation=activation,
                 correction_bias=correction_bias,
                 routing_scale=routing_scale,
+                fused_store=fused_store,
             )
         else:
             n_dense += 1
             continue
+        last_moe = layer.mlp
+    if last_moe is not None:
+        # プレフィル終了地点（最終MoE層）で融合テンソルのバッファを返却させる
+        last_moe._is_last_moe = True
     if n_dense:
         print(f"  dense層{n_dense}個はストリーミング対象外のまま常駐（通常のMLP）")
     mx.clear_cache()

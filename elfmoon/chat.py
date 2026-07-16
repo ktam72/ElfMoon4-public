@@ -36,6 +36,9 @@ SYSTEM = "You are an expert coding assistant. Write clean, correct, concise code
 MAX_TOKENS = 16384
 MAX_HISTORY = 8
 TEMP = 0.4
+# プレフィルのチャンク幅。stream_generate 既定(512)は融合gather経路の閾値未満で
+# 高速化されないため大きくする。api_server.py と同じ環境変数で連動。
+PREFILL_STEP = int(os.environ.get("ELFMOON_PREFILL_STEP", "4096"))
 
 
 def _strip_think(text_iter, no_think):
@@ -230,6 +233,7 @@ def main():
                     prompt=prompt,
                     max_tokens=MAX_TOKENS,
                     sampler=_sampler,
+                    prefill_step_size=PREFILL_STEP,
                 )
                 generator = stream_generate(**_gen_kwargs)
 
