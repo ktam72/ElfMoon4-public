@@ -91,7 +91,7 @@ gather_qmm 経路でも expert 7倍・non-expert 3.7倍のため:
 
 ## 5. 判定
 
-**V4-Flash は 24GB eco の実用圏外。**
+**PM 判断: 中止（2026-07-17）。V4-Flash は 24GB eco の実用圏外。**
 
 | 基準 | 結果 | 判定 |
 |------|------|------|
@@ -100,9 +100,4 @@ gather_qmm 経路でも expert 7倍・non-expert 3.7倍のため:
 | prefill 実用的 | 1M context で ~10時間 | ❌ |
 | 80B との改善 | 7倍大きい expert + 3.7倍 active = 実効性能 1/10〜1/20 | ❌ |
 
-### 選択肢（PM 判断）
-
-1. **中止**: V4-Flash は 24GB Apple Silicon の実用圏外。リソースを他に振る。
-2. **perf モード前提**: 64GB/128GB 以上のメモリを前提に再設計。expert cache 容量を増やせるが、ExpertStore の 132GB 全展開は不可のまま。
-3. **V4-Pro は論外**: 1.6T total / 49B active。eco 24GB では全く収まらない。
-4. **80B の prefill/pipeline 最適化に集中**: 既に効くと分かっている方向（postmortem の方針）。
+**決定: 80B の prefill/pipeline 最適化に集中。** V4 対応は、より大きなメモリ（64GB+）の環境が揃い、なおかつ需要が確認された場合に再検討する。現時点では起票しない。
