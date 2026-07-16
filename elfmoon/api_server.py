@@ -463,6 +463,9 @@ class GenerationEngine:
         if self._model_type == "gemma4":
             kwargs["top_p"] = 0.95
             kwargs["top_k"] = 64
+        elif "ornith" in self._model_name:
+            kwargs["top_p"] = 1.0
+            kwargs["top_k"] = 64
         return kwargs
 
     # ---- 以下、generation スレッド ---- #
@@ -530,6 +533,7 @@ class GenerationEngine:
         model_type = cfg.get("model_type", "")
 
         self._model_type = model_type
+        self._model_name = mp.name.lower()
 
         if model_type == "deepseek_v4":
             from model_v4 import DeepseekV4Model
@@ -887,7 +891,13 @@ class APIHandler(BaseHTTPRequestHandler):
             )
 
         max_tokens = min(body.get("max_tokens", MAX_TOKENS), MAX_TOKENS)
-        _def_temp = TEMP if _get_engine()._model_type != "gemma4" else 1.0
+        eng = _get_engine()
+        if eng._model_type == "gemma4":
+            _def_temp = 1.0
+        elif "ornith" in eng._model_name:
+            _def_temp = 1.0
+        else:
+            _def_temp = TEMP
         temperature = body.get("temperature", _def_temp)
         tools = body.get("tools", None)
         tool_choice = body.get("tool_choice", "auto")

@@ -39,6 +39,8 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 | **[Gemma4-26B-A4B-it-heretic-4bit](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-heretic-4bit)**（最推奨） | オンメモリ | 15.6 GB | **~70-85** | Heretic 変種、同一性能 |
 | **[Qwen3.6-35B-A3B](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)**（推奨） | ストリーミング MoE | 19 GB | ~16-22 | 思考モード対応、高速 |
 | **[Qwen3.6-35B-A3B-uncensored-heretic](https://huggingface.co/froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit)**（実験的） | ストリーミング MoE | 19 GB | ~16-22 | Heretic 変種、要分解 |
+| **[Ornith-1.0-35B](https://huggingface.co/mlx-community/Ornith-1.0-35B-4bit)** | ストリーミング MoE | 37 GB | ~16-18 | エージェンティックコーディング特化、SOTA |
+| **[Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/dawncr0w/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-OptiQ-4bit-MLX)**（実験的） | ストリーミング MoE | ~18 GB | ~16-18 | 完全アンセンサード、OptiQ量子化、Layer39注意 |
 | **[DeepSeek-R1-Distill-Qwen-14B-4bit](https://huggingface.co/mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit)** | オンメモリ | 8.3 GB | ~30 | 軽量、日本語推論可 |
 | **[DeepSeek-R1-Distill-Qwen-32B-4bit](https://huggingface.co/mlx-community/DeepSeek-R1-Distill-Qwen-32B-Japanese-4bit)** | オンメモリ | 17 GB | ~12 | 日本語特化、思考プロセス表示 |
 | **[Ternary-Bonsai-27B-2bit](https://huggingface.co/mlx-community/Ternary-Bonsai-27B-2bit)** | オンメモリ | 8.5 GB | ~21.6 | 2bit ternary、軽量 |
@@ -109,6 +111,18 @@ HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit 
   --local-dir $ELFMOON_MODELS_ROOT/qwen3-next-80b-mlx
 python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3-next-80b-mlx
 python3 elfmoon/chat.py --model qwen3-next-80b-mlx
+
+# Ornith-1.0-35B（エージェンティックコーディング）
+HF_HUB_DISABLE_XET=1 hf download mlx-community/Ornith-1.0-35B-4bit \
+  --local-dir $ELFMOON_MODELS_ROOT/ornith-1.0-35b-mlx
+python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/ornith-1.0-35b-mlx
+python3 elfmoon/chat.py --model ornith-1.0-35b-mlx --perf
+
+# Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive（完全アンセンサード）
+HF_HUB_DISABLE_XET=1 hf download dawncr0w/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-OptiQ-4bit-MLX \
+  --local-dir $ELFMOON_MODELS_ROOT/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-mlx
+python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-mlx
+python3 elfmoon/chat.py --model qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-mlx
 
 # Qwen3-Coder-Next（コード特化）
 HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3-Coder-Next-4bit \
@@ -322,6 +336,7 @@ python3 integrate.py verify $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx /tmp/elfmoon_ve
 | ポート競合（Ollama） | 別ポートで起動（例: `api_server.py 8080`） |
 | 応答品質が急に劣化 | `rm -rf ~/.cache/elfmoon/kv_cache` でキャッシュクリア |
 | `--model NAME` でモデルが見つからない | `python3 elfmoon/chat.py --list` で `ELFMOON_MODELS_ROOT` 配下の認識状況を確認 |
+| HauhauCS Aggressive 最終層の shared expert 不一致 | OptiQ 量子化の artifact（自動検出・スキップ済み、実用影響なし） |
 
 ---
 
@@ -337,6 +352,8 @@ python3 integrate.py verify $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx /tmp/elfmoon_ve
 | **GLM-4.7-Flash-4bit** | オンメモリ | ~16.9 | 16.9 GB |
 | **DeepSeek-R1-Distill-Qwen-14B-4bit** | オンメモリ | ~30 | 8.3 GB |
 | **DeepSeek-R1-Distill-Qwen-32B-4bit** | オンメモリ | ~12 | 17 GB |
+| **Ornith-1.0-35B** | ストリーミング MoE | ~16-18 | ~11 GB |
+| **Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive** | ストリーミング MoE | ~16-18 | ~11 GB |
 | **Qwen3-Next-80B-A3B**（実験的） | ストリーミング MoE | ~9.7-10 | 12.9 GB |
 | **Qwen3-Coder-Next**（実験的） | ストリーミング MoE | ~10-12.5 | 12.3 GB |
 | **Qwen3.6-27B-4bit** | オンメモリ | ~11.5 | ~15 GB |

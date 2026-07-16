@@ -84,6 +84,19 @@ MODEL_PATH, STORE_DIR = resolve_model()
 
 
 @mx.compile
+def _infer_qparams(w, s):
+    """Infer (group_size, bits) from quantized weight and scales shapes."""
+    n_out, n_packed = w.shape
+    n_groups = s.shape[-1]
+    for bits in (4, 8):
+        effective = n_packed * 32 // bits
+        if effective % n_groups == 0:
+            gs = effective // n_groups
+            if gs in {32, 64, 128}:
+                return gs, bits
+    return 64, 4
+
+
 def _decode_moe(
     x: mx.array,
     w_gu: mx.array,
@@ -153,14 +166,15 @@ def _decode_moe(
         )
         se_g, se_u = se_gu[:, : se_gu.shape[-1] // 2], se_gu[:, se_gu.shape[-1] // 2 :]
         se_h = (se_g * mx.sigmoid(se_g)) * se_u
+        se_gs, se_bits = _infer_qparams(se_dw, se_ds)
         se_out = mx.quantized_matmul(
             se_h,
             se_dw,
             se_ds,
             se_db,
             transpose=True,
-            group_size=group_size,
-            bits=bits,
+            group_size=se_gs,
+            bits=se_bits,
             mode=mode,
         )
         if gated:
@@ -268,14 +282,15 @@ def _shared_ffn(x, shared, group_size, bits, mode):
     )
     se_g, se_u = se_gu[:, : se_gu.shape[-1] // 2], se_gu[:, se_gu.shape[-1] // 2 :]
     se_h = (se_g * mx.sigmoid(se_g)) * se_u
+    se_gs, se_bits = _infer_qparams(se_dw, se_ds)
     se_out = mx.quantized_matmul(
         se_h,
         se_dw,
         se_ds,
         se_db,
         transpose=True,
-        group_size=group_size,
-        bits=bits,
+        group_size=se_gs,
+        bits=se_bits,
         mode=mode,
     )
     if gated:
@@ -439,6 +454,16 @@ class StreamingMoE(nn.Module):
                 ) + se_tuple
             else:
                 self._shared = se_tuple
+            # Validate: gate+up intermediate size must match down_proj input dim
+            gu_inter = se_gu_w.shape[0] // 2
+            dw_gs, dw_bits = _infer_qparams(se.down_proj.weight, se.down_proj.scales)
+            dw_in = se.down_proj.weight.shape[-1] * 32 // dw_bits
+            if gu_inter != dw_in:
+                print(
+                    f"  layer {self.layer_idx}: shared expert dim mismatch (gate+up={gu_inter}, down={dw_in}) — disabling",
+                    flush=True,
+                )
+                self._shared = None
         else:
             self._shared = None
 
@@ -670,8 +695,15 @@ class StreamingMoE(nn.Module):
         se_g, se_u = se_h[..., :k2], se_h[..., k2:]
         se_gated = se_g * mx.sigmoid(se_g)
         se_act = se_gated * se_u
+        se_dw_gs, se_dw_bits = _infer_qparams(se_dw, se_ds)
         se_out = mx.quantized_matmul(
-            se_act, se_dw, se_ds, se_db, transpose=True, group_size=GROUP, bits=BITS
+            se_act,
+            se_dw,
+            se_ds,
+            se_db,
+            transpose=True,
+            group_size=se_dw_gs,
+            bits=se_dw_bits,
         )
         se_out = se_out.reshape(out.shape)
         if gated:

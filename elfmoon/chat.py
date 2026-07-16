@@ -118,9 +118,14 @@ def main():
     _model_type = _cfg.get("model_type", "")
 
     _sampler_kwargs = {}
+    _model_name = os.path.basename(model_path).lower()
     if _model_type == "gemma4":
         TEMP = 1.0
         _sampler_kwargs = dict(temp=TEMP, top_p=0.95, top_k=64)
+    elif "ornith" in _model_name:
+        # Ornith 推奨: agentic coding temp=1.0, top_p=1.0
+        TEMP = 1.0
+        _sampler_kwargs = dict(temp=TEMP, top_p=1.0, top_k=64)
     else:
         TEMP = 0.4
 
