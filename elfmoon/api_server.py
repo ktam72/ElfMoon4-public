@@ -142,7 +142,7 @@ def _parse_gemma4_args(text: str) -> dict:
         pass
     try:
         return ast.literal_eval(text)
-    except (ValueError, SyntaxError):
+    except (ValueError, SyntaxError, TypeError):
         pass
     # 簡易パース: {key: "val", key2: 123} 形式
     # str.strip("{}") はネストした {} を壊すため使わない
@@ -1068,7 +1068,11 @@ class APIHandler(BaseHTTPRequestHandler):
                                     "created": created,
                                     "model": MODEL_ID,
                                     "choices": [
-                                        {"index": 0, "delta": {"content": ctext}, "finish_reason": None}
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": ctext},
+                                            "finish_reason": None,
+                                        }
                                     ],
                                 },
                                 ensure_ascii=False,
@@ -1094,7 +1098,11 @@ class APIHandler(BaseHTTPRequestHandler):
                                 "created": created,
                                 "model": MODEL_ID,
                                 "choices": [
-                                    {"index": 0, "delta": {"tool_calls": tc_delta}, "finish_reason": None}
+                                    {
+                                        "index": 0,
+                                        "delta": {"tool_calls": tc_delta},
+                                        "finish_reason": None,
+                                    }
                                 ],
                             },
                             ensure_ascii=False,
