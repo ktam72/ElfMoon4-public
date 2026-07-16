@@ -685,7 +685,20 @@ class GenerationEngine:
         model = self._model
         eos_ids = getattr(tokenizer, "eos_token_ids", None) or {tokenizer.eos_token_id}
 
-        # MCP ツールは API ハンドラ側で注入済み。ここでは何もしない
+        if tools:
+            messages = list(messages)
+            messages.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": (
+                        "Preserve file names exactly as given by the user. "
+                        "Do NOT translate, romanize, or localize file names. "
+                        "For example, if the user asks about 'マーメイド.mmd', "
+                        "use 'マーメイド.mmd' literally, not 'mermaid.mmd'."
+                    ),
+                },
+            )
 
         MAX_ROUNDS = 10
         round_idx = 0
