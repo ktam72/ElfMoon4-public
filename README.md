@@ -33,20 +33,22 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 ---
 ## 動作確認済みモデル
 
-| モデル | タイプ | サイズ | デコード t/s | 備考 |
+| モデル | タイプ | ファイルサイズ | デコード t/s | 備考 |
 |---|---|---|---|---|
-| **[Gemma4-26B-A4B-it-4bit](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-4bit)**（最推奨） | オンメモリ | 15 GB | **~70-85** | `mx.compile` で 5×高速化。品質・速度・メモリの最適バランス |
-| **[Gemma4-26B-A4B-it-heretic-4bit](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-heretic-4bit)**（最推奨） | オンメモリ | 15.6 GB | **~70-85** | Heretic 変種、同一性能 |
-| **[Qwen3.6-35B-A3B](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)**（推奨） | ストリーミング MoE | 19 GB | ~16-22 | 思考モード対応、高速 |
-| **[Qwen3.6-35B-A3B-uncensored-heretic](https://huggingface.co/froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit)**（実験的） | ストリーミング MoE | 19 GB | ~16-22 | Heretic 変種、要分解 |
-| **[DeepSeek-R1-Distill-Qwen-14B-4bit](https://huggingface.co/mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit)** | オンメモリ | 8.3 GB | ~30 | 軽量、日本語推論可 |
-| **[DeepSeek-R1-Distill-Qwen-32B-4bit](https://huggingface.co/mlx-community/DeepSeek-R1-Distill-Qwen-32B-Japanese-4bit)** | オンメモリ | 17 GB | ~12 | 日本語特化、思考プロセス表示 |
-| **[Ternary-Bonsai-27B-2bit](https://huggingface.co/mlx-community/Ternary-Bonsai-27B-2bit)** | オンメモリ | 8.5 GB | ~21.6 | 2bit ternary、軽量 |
-| **[GLM-4.7-Flash-4bit](https://huggingface.co/mlx-community/GLM-4.7-Flash-4bit)** | オンメモリ | 16.9 GB | ~16.9 | Zhipu 製、日本語可 |
-| **[Qwen3-Next-80B-A3B](https://huggingface.co/mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit)**（実験的） | ストリーミング MoE | 42 GB | ~9.7-10 | 品質重視向け |
-| **[Qwen3-Coder-Next](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit)**（実験的） | ストリーミング MoE | 42 GB | ~10-12.5 | コード特化 |
-| **[Qwen3.6-27B-4bit](https://huggingface.co/mlx-community/Qwen3.6-27B-4bit)** | オンメモリ | ~15 GB | ~11.5 | dense 27B |
-| **[Qwen3.5-REAP-97B-A10B](https://huggingface.co/mlx-community/Qwen3.5-REAP-97B-A10B-4bit)**（非推奨） | ストリーミング MoE | 51 GB | ~3.4 | capacity 要大幅減 |
+| **[Gemma4-26B-A4B-it-4bit](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-4bit)**（最推奨） | オンメモリ | 15 GB | **72** | `mx.compile` で 5×高速化。品質・速度の最適バランス |
+| **[Gemma4-Heretic](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-heretic-4bit)** | オンメモリ | 15.6 GB | **65** | Heretic 変種 |
+| **[GLM-4.7-Flash](https://huggingface.co/mlx-community/GLM-4.7-Flash-4bit)** | オンメモリ | 16.9 GB | **61** | Zhipu 製、日本語可、高速 |
+| **[Qwen3.6-35B-A3B](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)**（推奨） | ストリーミング MoE | 19 GB | **37** | 思考モード対応、省メモリ |
+| **[Qwen3.6-35B-HauhauCS](https://huggingface.co/dawncr0w/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-OptiQ-4bit-MLX)**（実験的） | ストリーミング MoE | 18 GB | **36** | 完全アンセンサード |
+| **[Ornith-1.0-35B](https://huggingface.co/mlx-community/Ornith-1.0-35B-4bit)** | ストリーミング MoE | 37 GB | **35** | エージェンティックコーディング特化 |
+| **[Qwen3.6-35B-Heretic](https://huggingface.co/froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit)**（実験的） | ストリーミング MoE | 19 GB | **35** | Heretic 変種 |
+| **[Bonsai-27B-2bit](https://huggingface.co/mlx-community/Ternary-Bonsai-27B-2bit)** | オンメモリ | 8.5 GB | **24** | 2bit ternary、軽量 |
+| **[Qwen3-Next-80B](https://huggingface.co/mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit)**（実験的） | ストリーミング MoE | 42 GB | **25** | 品質重視 80B |
+| **[Qwen3-Coder-Next](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit)** | ストリーミング MoE | 42 GB | **22** | コード特化 |
+| **[Qwen3.6-27B](https://huggingface.co/mlx-community/Qwen3.6-27B-4bit)** | オンメモリ | 15 GB | **15** | dense 27B |
+
+| **[Qwen3.5-REAP-97B](https://huggingface.co/mlx-community/Qwen3.5-REAP-97B-A10B-4bit)**（非推奨） | ストリーミング MoE | 51 GB | — | capacity 要大幅減 |
+| **[DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark)** | — | — | — | 24GB では未対応 |
 
 ---
 
@@ -109,6 +111,18 @@ HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit 
   --local-dir $ELFMOON_MODELS_ROOT/qwen3-next-80b-mlx
 python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3-next-80b-mlx
 python3 elfmoon/chat.py --model qwen3-next-80b-mlx
+
+# Ornith-1.0-35B（エージェンティックコーディング）
+HF_HUB_DISABLE_XET=1 hf download mlx-community/Ornith-1.0-35B-4bit \
+  --local-dir $ELFMOON_MODELS_ROOT/ornith-1.0-35b-mlx
+python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/ornith-1.0-35b-mlx
+python3 elfmoon/chat.py --model ornith-1.0-35b-mlx --perf
+
+# Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive（完全アンセンサード）
+HF_HUB_DISABLE_XET=1 hf download dawncr0w/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-OptiQ-4bit-MLX \
+  --local-dir $ELFMOON_MODELS_ROOT/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-mlx
+python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-mlx
+python3 elfmoon/chat.py --model qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-mlx
 
 # Qwen3-Coder-Next（コード特化）
 HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3-Coder-Next-4bit \
@@ -322,28 +336,32 @@ python3 integrate.py verify $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx /tmp/elfmoon_ve
 | ポート競合（Ollama） | 別ポートで起動（例: `api_server.py 8080`） |
 | 応答品質が急に劣化 | `rm -rf ~/.cache/elfmoon/kv_cache` でキャッシュクリア |
 | `--model NAME` でモデルが見つからない | `python3 elfmoon/chat.py --list` で `ELFMOON_MODELS_ROOT` 配下の認識状況を確認 |
+| HauhauCS Aggressive 最終層の shared expert 不一致 | OptiQ 量子化の artifact（自動検出・スキップ済み、実用影響なし） |
 
 ---
 
 
-## パフォーマンス（M4 Pro 24GB）
+## パフォーマンス（M4 Pro 24GB, warm A/B, 120 tokens, 2プロンプト平均）
 
-| モデル | タイプ | デコード t/s | ピークメモリ |
-|--------|--------|:-:|:-:|
-| **Gemma4-26B-A4B-it-4bit** | オンメモリ | **~70-85** | ~10 GB |
-| **Gemma4-26B-A4B-it-heretic-4bit** | オンメモリ | **~70-85** | ~10 GB |
-| **Qwen3.6-35B-A3B**（推奨） | ストリーミング MoE | ~16-22 | 12.7 GB |
-| **Ternary-Bonsai-27B-2bit** | オンメモリ | ~21.6 | 8.5 GB |
-| **GLM-4.7-Flash-4bit** | オンメモリ | ~16.9 | 16.9 GB |
-| **DeepSeek-R1-Distill-Qwen-14B-4bit** | オンメモリ | ~30 | 8.3 GB |
-| **DeepSeek-R1-Distill-Qwen-32B-4bit** | オンメモリ | ~12 | 17 GB |
-| **Qwen3-Next-80B-A3B**（実験的） | ストリーミング MoE | ~9.7-10 | 12.9 GB |
-| **Qwen3-Coder-Next**（実験的） | ストリーミング MoE | ~10-12.5 | 12.3 GB |
-| **Qwen3.6-27B-4bit** | オンメモリ | ~11.5 | ~15 GB |
+| モデル | タイプ | gen t/s | decode t/s | ピークメモリ |
+|--------|--------|:-:|:-:|:-:|
+| **Gemma4-26B-A4B-it-4bit** | オンメモリ | **69** | **72** | 14.2 GB |
+| **Gemma4-26B-A4B-it-heretic-4bit** | オンメモリ | **63** | **65** | 14.5 GB |
+| **GLM-4.7-Flash** | オンメモリ | **60** | **61** | 16.9 GB |
+| **Bonsai-27B-2bit** | オンメモリ | **24** | **24** | 7.6 GB |
+| **Qwen3.6-35B**（推奨） | ストリーミング MoE | 20 | **37** | 12.1 GB |
+| **Ornith-1.0-35B** | ストリーミング MoE | 17 | **35** | 12.1 GB |
+| **Qwen3.6-35B-HauhauCS** | ストリーミング MoE | 19 | **36** | 12.1 GB |
+| **Qwen3.6-35B-Heretic** | ストリーミング MoE | 16 | **35** | 12.1 GB |
+| **Qwen3-Next-80B**（実験的） | ストリーミング MoE | 12 | **25** | 12.2 GB |
+| **Qwen3-Coder-Next** | ストリーミング MoE | 10 | **22** | 12.2 GB |
+| **Qwen3.6-27B** | オンメモリ | 15 | **15** | 15.1 GB |
 
-- オンメモリモデルは `mx.compile` による JIT コンパイル済み（Gemma4 系は約 5× 高速化、Qwen/GLM/Bonsai は 1.2-1.5×）
-- ストリーミング MoE モデルはエキスパートグループ化プリフィル（最大 24 倍高速化）と LRU キャッシュで low-memory 動作を実現
-- Gemma4 は品質・速度・メモリの最適バランス。会話・コード・推論いずれも高品質
+- 計測条件: subprocess でモデル切替、warm 8tok + generate 120tok、2種類のプロンプト平均
+- gen t/s: stream_generate 合計（prefill+decode） / decode t/s: デコードのみ（per-step loop）
+- ストリーミング MoE 35B 級は decode 35-37 t/s で一律。80B 級は decode 22-25 t/s
+- オンメモリモデルは `mx.compile` による JIT コンパイル（Gemma4/GLM は 5× 高速化）
+- Gemma4 は品質・速度の最適バランス。ストリーミング MoE は低メモリで大規模モデル動作
 
 ---
 
