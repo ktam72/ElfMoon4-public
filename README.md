@@ -37,10 +37,10 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 |---|---|---|---|---|
 | **[Gemma4-26B-A4B-it-4bit](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-4bit)**（最推奨） | オンメモリ | 15 GB | **~70-85** | `mx.compile` で 5×高速化。品質・速度・メモリの最適バランス |
 | **[Gemma4-26B-A4B-it-heretic-4bit](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-heretic-4bit)**（最推奨） | オンメモリ | 15.6 GB | **~70-85** | Heretic 変種、同一性能 |
-| **[Qwen3.6-35B-A3B](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)**（推奨） | ストリーミング MoE | 19 GB | ~16-22 | 思考モード対応、高速 |
-| **[Qwen3.6-35B-A3B-uncensored-heretic](https://huggingface.co/froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit)**（実験的） | ストリーミング MoE | 19 GB | ~16-22 | Heretic 変種、要分解 |
-| **[Ornith-1.0-35B](https://huggingface.co/mlx-community/Ornith-1.0-35B-4bit)** | ストリーミング MoE | 37 GB | ~16-18 | エージェンティックコーディング特化、SOTA |
-| **[Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/dawncr0w/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-OptiQ-4bit-MLX)**（実験的） | ストリーミング MoE | ~18 GB | ~16-18 | 完全アンセンサード、OptiQ量子化、Layer39注意 |
+| **[Qwen3.6-35B-A3B](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)**（推奨） | ストリーミング MoE | 19 GB | ~37 (decode) / ~11-18 (gen) | 思考モード対応、高速 |
+| **[Qwen3.6-35B-A3B-uncensored-heretic](https://huggingface.co/froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit)**（実験的） | ストリーミング MoE | 19 GB | ~37 (decode) | Heretic 変種、要分解 |
+| **[Ornith-1.0-35B](https://huggingface.co/mlx-community/Ornith-1.0-35B-4bit)** | ストリーミング MoE | 37 GB | ~37 (decode) / ~18 (gen) | エージェンティックコーディング特化、SOTA |
+| **[Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/dawncr0w/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-OptiQ-4bit-MLX)**（実験的） | ストリーミング MoE | ~18 GB | ~36 (decode) | 完全アンセンサード、OptiQ量子化、Layer39注意 |
 | **[DeepSeek-R1-Distill-Qwen-14B-4bit](https://huggingface.co/mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit)** | オンメモリ | 8.3 GB | ~30 | 軽量、日本語推論可 |
 | **[DeepSeek-R1-Distill-Qwen-32B-4bit](https://huggingface.co/mlx-community/DeepSeek-R1-Distill-Qwen-32B-Japanese-4bit)** | オンメモリ | 17 GB | ~12 | 日本語特化、思考プロセス表示 |
 | **[Ternary-Bonsai-27B-2bit](https://huggingface.co/mlx-community/Ternary-Bonsai-27B-2bit)** | オンメモリ | 8.5 GB | ~21.6 | 2bit ternary、軽量 |
@@ -347,7 +347,9 @@ python3 integrate.py verify $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx /tmp/elfmoon_ve
 |--------|--------|:-:|:-:|
 | **Gemma4-26B-A4B-it-4bit** | オンメモリ | **~70-85** | ~10 GB |
 | **Gemma4-26B-A4B-it-heretic-4bit** | オンメモリ | **~70-85** | ~10 GB |
-| **Qwen3.6-35B-A3B**（推奨） | ストリーミング MoE | ~16-22 | 12.7 GB |
+| **Qwen3.6-35B-A3B**（推奨） | ストリーミング MoE | ~37 (decode) / ~11-18 (gen) | 11.8 GB |
+| **Ornith-1.0-35B** | ストリーミング MoE | ~37 (decode) / ~18 (gen) | 11.8 GB |
+| **Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive** | ストリーミング MoE | ~36 (decode) | 11.8 GB |
 | **Ternary-Bonsai-27B-2bit** | オンメモリ | ~21.6 | 8.5 GB |
 | **GLM-4.7-Flash-4bit** | オンメモリ | ~16.9 | 16.9 GB |
 | **DeepSeek-R1-Distill-Qwen-14B-4bit** | オンメモリ | ~30 | 8.3 GB |
