@@ -466,6 +466,9 @@ class GenerationEngine:
         elif "ornith" in self._model_name:
             kwargs["top_p"] = 1.0
             kwargs["top_k"] = 64
+        elif "glm" in self._model_name:
+            kwargs["top_p"] = 0.95
+            kwargs["min_p"] = 0.01
         return kwargs
 
     # ---- 以下、generation スレッド ---- #
@@ -895,6 +898,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if eng._model_type == "gemma4":
             _def_temp = 1.0
         elif "ornith" in eng._model_name:
+            _def_temp = 1.0
+        elif "glm" in eng._model_name:
             _def_temp = 1.0
         else:
             _def_temp = TEMP

@@ -126,6 +126,10 @@ def main():
         # Ornith 推奨: agentic coding temp=1.0, top_p=1.0
         TEMP = 1.0
         _sampler_kwargs = dict(temp=TEMP, top_p=1.0, top_k=64)
+    elif "glm" in _model_name:
+        # GLM 推奨: temp=1.0, top_p=0.95, min_p=0.01（repeat_penalty=1.0は未対応）
+        TEMP = 1.0
+        _sampler_kwargs = dict(temp=TEMP, top_p=0.95, min_p=0.01)
     else:
         TEMP = 0.4
 
