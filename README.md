@@ -33,7 +33,7 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 ---
 ## 動作確認済みモデル
 
-| モデル | タイプ | サイズ | デコード t/s | 備考 |
+| モデル | タイプ | ファイルサイズ | デコード t/s | 備考 |
 |---|---|---|---|---|
 | **[Gemma4-26B-A4B-it-4bit](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-4bit)**（最推奨） | オンメモリ | 15 GB | **72** | `mx.compile` で 5×高速化。品質・速度の最適バランス |
 | **[Gemma4-Heretic](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-heretic-4bit)** | オンメモリ | 15.6 GB | **65** | Heretic 変種 |
