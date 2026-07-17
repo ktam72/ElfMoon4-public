@@ -42,6 +42,7 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 | **[Qwen3.6-35B-HauhauCS](https://huggingface.co/dawncr0w/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-OptiQ-4bit-MLX)**（実験的） | ストリーミング MoE | 18 GB | **36** | 完全アンセンサード |
 | **[Ornith-1.0-35B](https://huggingface.co/mlx-community/Ornith-1.0-35B-4bit)** | ストリーミング MoE | 37 GB | **35** | エージェンティックコーディング特化 |
 | **[Qwen3.6-35B-Heretic](https://huggingface.co/froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit)**（実験的） | ストリーミング MoE | 19 GB | **35** | Heretic 変種 |
+| **[Huihui-Qwen3.5-Claude-4.6-Opus-abliterated](https://huggingface.co/mlx-community/Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-4bit)** | ストリーミング MoE | 14 GB | **28** | Opus推論蒸馏・アブリテイテッド、要tokenizer修正 |
 | **[Bonsai-27B-2bit](https://huggingface.co/mlx-community/Ternary-Bonsai-27B-2bit)** | オンメモリ | 8.5 GB | **24** | 2bit ternary、軽量 |
 | **[Qwen3-Next-80B](https://huggingface.co/mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit)**（実験的） | ストリーミング MoE | 42 GB | **25** | 品質重視 80B |
 | **[Qwen3-Coder-Next](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit)** | ストリーミング MoE | 42 GB | **22** | コード特化 |
@@ -350,6 +351,7 @@ python3 integrate.py verify $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx /tmp/elfmoon_ve
 | **Bonsai-27B-2bit** | オンメモリ | **24** | **24** | 7.6 GB |
 | **Qwen3.6-35B**（推奨） | ストリーミング MoE | 20 | **37** | 12.1 GB |
 | **Ornith-1.0-35B** | ストリーミング MoE | 17 | **35** | 12.1 GB |
+| **Huihui-Opus-abliterated** | ストリーミング MoE | 22 | **28** | 11.1 GB |
 | **Qwen3.6-35B-HauhauCS** | ストリーミング MoE | 19 | **36** | 12.1 GB |
 | **Qwen3.6-35B-Heretic** | ストリーミング MoE | 16 | **35** | 12.1 GB |
 | **Qwen3-Next-80B**（実験的） | ストリーミング MoE | 12 | **25** | 12.2 GB |
