@@ -42,43 +42,39 @@ PREFILL_STEP = int(os.environ.get("ELFMOON_PREFILL_STEP", "4096"))
 
 
 def _strip_think(text_iter, no_think):
-    """Strip <think> block from stream if no_think is set.
+    """Strip <think>/</think> blocks from stream if no_think is set.
 
-    enable_thinking=False をテンプレートが尊重するモデルは <think> タグ自体を
-    一切生成しないため、その場合はバッファせず即座に素通しする（先頭が
-    "<think" で始まらないかを数文字だけ覗き見て判定）。判定できるまでの
-    数文字はバッファするが、"<think" と確定しなければ即フラッシュする。
+    以下2形式に対応:
+    1. <think>...</think> 形式（Qwen標準、templateが開きタグを出力）
+    2. 開きタグ無しで推論内容→</think> 形式（一部fine-tuneモデル）
     """
     if not no_think:
         yield from text_iter
         return
 
-    PEEK = len("<think>")
     buf = ""
-    peeking = True
     for piece in text_iter:
-        if peeking:
-            buf += piece
-            if len(buf) < PEEK and "<think>".startswith(buf):
-                continue  # まだ判定に十分な文字数がない
-            peeking = False
-            if not buf.lstrip().startswith("<think"):
-                # このモデルは enable_thinking=False で think を生成しない → 即素通し
-                yield buf
-                yield from text_iter
-                return
-            # 以降は従来通り </think> まで除去するモード
-        else:
-            buf += piece
-        idx = buf.find("</think>")
-        if idx >= 0:
-            after = buf[idx + 8 :]
+        buf += piece
+        # 開きタグがあれば以降を discard
+        if "<think" in buf:
+            buf = buf[buf.find("<think") + len("<think>") :]
+            while "</think>" not in buf:
+                buf = next(text_iter, "")
+                if not buf:
+                    return
+            after = buf.split("</think>", 1)[1]
             if after:
                 yield after
-            buf = ""
             yield from text_iter
             return
-    # </think> が最後まで現れなかった場合、溜めた分を破棄せず出力する
+        if "</think>" in buf:
+            after = buf.split("</think>", 1)[1]
+            if after:
+                yield after
+            yield from text_iter
+            return
+        yield buf
+        buf = ""
     if buf:
         yield buf
 
@@ -116,6 +112,22 @@ def main():
     with open(os.path.join(model_path, "config.json")) as f:
         _cfg = json.load(f)
     _model_type = _cfg.get("model_type", "")
+
+    _sampler_kwargs = {}
+    _model_name = os.path.basename(model_path).lower()
+    if _model_type == "gemma4":
+        TEMP = 1.0
+        _sampler_kwargs = dict(temp=TEMP, top_p=0.95, top_k=64)
+    elif "ornith" in _model_name:
+        # Ornith 推奨: agentic coding temp=1.0, top_p=1.0
+        TEMP = 1.0
+        _sampler_kwargs = dict(temp=TEMP, top_p=1.0, top_k=64)
+    elif "glm" in _model_name:
+        # GLM 推奨: temp=1.0, top_p=0.95, min_p=0.01（repeat_penalty=1.0は未対応）
+        TEMP = 1.0
+        _sampler_kwargs = dict(temp=TEMP, top_p=0.95, min_p=0.01)
+    else:
+        TEMP = 0.4
 
     mode = "性能" if perf else "省メモリ"
     print(f"モデル: {model_path}（type={_model_type}）")
@@ -226,7 +238,7 @@ def main():
                 answer_t = time.perf_counter()
                 print(resp, end="", flush=True)
             else:
-                _sampler = make_sampler(temp=TEMP)
+                _sampler = make_sampler(**_sampler_kwargs)
                 _gen_kwargs = dict(
                     model=model,
                     tokenizer=tok,
