@@ -58,25 +58,25 @@ def _strip_think(text_iter, no_think):
         # 開きタグがあれば以降を discard
         if "<think" in buf:
             buf = buf[buf.find("<think") + len("<think>") :]
-            # </think> を探す
             while "</think>" not in buf:
                 buf = next(text_iter, "")
                 if not buf:
                     return
-            # </think> 以降を yield
             after = buf.split("</think>", 1)[1]
             if after:
                 yield after
             yield from text_iter
             return
-        # 開きタグ無しで </think> が来たらそれ以前を discard
         if "</think>" in buf:
             after = buf.split("</think>", 1)[1]
             if after:
                 yield after
             yield from text_iter
             return
-    yield buf
+        yield buf
+        buf = ""
+    if buf:
+        yield buf
 
 
 def main():
