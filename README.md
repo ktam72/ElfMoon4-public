@@ -46,8 +46,7 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 | **[Qwen3-Next-80B](https://huggingface.co/mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit)**（実験的） | ストリーミング MoE | 42 GB | **25** | 品質重視 80B |
 | **[Qwen3-Coder-Next](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit)** | ストリーミング MoE | 42 GB | **22** | コード特化 |
 | **[Qwen3.6-27B](https://huggingface.co/mlx-community/Qwen3.6-27B-4bit)** | オンメモリ | 15 GB | **15** | dense 27B |
-| **[DeepSeek-R1-Distill-Qwen-14B](https://huggingface.co/mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit)** | オンメモリ | 8.3 GB | ~30 | 軽量、日本語推論可 |
-| **[DeepSeek-R1-Distill-Qwen-32B](https://huggingface.co/mlx-community/DeepSeek-R1-Distill-Qwen-32B-Japanese-4bit)** | オンメモリ | 17 GB | ~12 | 日本語特化 |
+
 | **[Qwen3.5-REAP-97B](https://huggingface.co/mlx-community/Qwen3.5-REAP-97B-A10B-4bit)**（非推奨） | ストリーミング MoE | 51 GB | — | capacity 要大幅減 |
 | **[DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark)** | — | — | — | 24GB では未対応 |
 
@@ -357,8 +356,6 @@ python3 integrate.py verify $ELFMOON_MODELS_ROOT/qwen3.6-35b-mlx /tmp/elfmoon_ve
 | **Qwen3-Next-80B**（実験的） | ストリーミング MoE | 12 | **25** | 12.2 GB |
 | **Qwen3-Coder-Next** | ストリーミング MoE | 10 | **22** | 12.2 GB |
 | **Qwen3.6-27B** | オンメモリ | 15 | **15** | 15.1 GB |
-| **DeepSeek-R1-Distill-Qwen-14B** | オンメモリ | — | ~30 | 8.3 GB |
-| **DeepSeek-R1-Distill-Qwen-32B** | オンメモリ | — | ~12 | 17 GB |
 
 - 計測条件: subprocess でモデル切替、warm 8tok + generate 120tok、2種類のプロンプト平均
 - gen t/s: stream_generate 合計（prefill+decode） / decode t/s: デコードのみ（per-step loop）
