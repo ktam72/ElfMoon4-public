@@ -46,7 +46,7 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 | **[Qwen3-Next-80B](https://huggingface.co/mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit)**（実験的） | ストリーミング MoE | 42 GB | **25** | 品質重視 80B |
 | **[Qwen3-Coder-Next](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit)** | ストリーミング MoE | 42 GB | **22** | コード特化 |
 | **[Qwen3.6-27B](https://huggingface.co/mlx-community/Qwen3.6-27B-4bit)** | オンメモリ | 15 GB | **15** | dense 27B |
-| **[Qwen3.5-REAP-97B](https://huggingface.co/mlx-community/Qwen3.5-REAP-97B-A10B-4bit)**（非推奨） | ストリーミング MoE | 51 GB | — | capacity 要大幅減 |
+| **[Qwen3.5-REAP-97B](https://huggingface.co/mlx-community/Qwen3.5-REAP-97B-A10B-4bit)**（非推奨） | ストリーミング MoE | 51 GB | **13-14** | cap=2048で14GB/14t/s, cap=1024で9GB/13t/s |
 | **[DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark)** | — | — | — | 24GB では未対応 |
 
 ---
