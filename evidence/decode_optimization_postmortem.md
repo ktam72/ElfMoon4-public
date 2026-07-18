@@ -1,60 +1,72 @@
-# 80B Decode 高速化キャンペーン 総括
+# decode_optimization_postmortem
 
-- 作成日: 2026-07-17
-- 期間: 2026-07-15 〜 2026-07-17
-- 結論: **decode 側の高速化は打ち止め。prefill 側に資源集中。**
+このドキュメントは decode 高速化の試行錯誤を記録する。
+各エントリは試行・結果・死因を1-3行で要約する。
 
-## 試行した方向
+---
 
-| 試行 | 結果 | 要因 |
-|------|------|------|
-| 投機デコード (R≒4.75) | 不可 | compiled 単トークン decode が既に速く、group 検証パスが 4.75× コスト、tok/pass ~1.7 では相殺不能（35B 実測） |
-| Stage A: global LRU + mx.take | 0.66× FAIL | mx.take のコピーコストが mx.stack より大 |
-| Stage B: gather_qmm GSC + M2 | 0.55× FAIL | M2 fill で SSD I/O 大量発生、GSC 二重保持で OOM |
-| gather_qmm prefill | **成功 (3.5×)** | 融合テンソル mmap + gather_qmm で prefill が 3.5倍 |
+## 2026-07-18: GlobalSlotCache（GSC）
 
-## 死因分析
+- **方法**: ResidentCache + GlobalSlotCache 二重キャッシュ + gather_qmm
+- **結果**: 0.28x（baseline比）、OOM 多発
+- **死因**: M2 fill の SSD ロード＋二重キャッシュ OOM。
+  （#18 で gather_qmm カーネル自体は隔離 2.5x と確認。GSC の死因は二重化と SSD ロードに限定。）
+- **指示**: `directive_deepseek_09_dispatch_batch.md`
 
-### GSC decode の死因（3層）
+## 2026-07-18: expert 低ビット化
 
-1. **M2 fill が store.load（SSD I/O）を大量発生させる**: ResidentCache は hit 率 83.9% で大部分の expert を CPU メモリから返す。GSC は容量不足で cold-thrash し、毎 step の M2 fill が SSD I/O をトリガ → 8.2 t/s に低下。
-2. **GSC + ResidentCache の二重保持がメモリを圧迫**: ResidentCache 単体で 10.4GB。GSC (2000 slots) で 3.3GB 追加 → eco 6144 に収まらず OOM の危機。容量を減らせば thrash 加速。
-3. **per-layer eval+tolist が除去できない**: miss 検出に idx の CPU 値が必要（`mx.eval(idx,w)` + `tolist()`）。GSC パスでもこの同期は残り、狙った「全 GPU 化」は達成できず。
+- **方法**: 2bit/3bit requantization
+- **結果**: SSD前提シナリオで最大 ~2x 確認したが品質低下が顕著
+- **死因**: 品質トレードオフが許容範囲外
+- **指示**: `directive_deepseek_14_bits_topk.md` Task ①
 
-### 本質的制約
+## 2026-07-18: top_k 削減
 
-**decode の 1 step は active ~3B params（4-bit で ~1.5GB/token）の expert 重みを統一メモリから GPU が読む帯域に律速される。** このバイト数を減らす機構はなく、gather/cache 再配置では帯域が減らない。帯域不足なら投機（accept 率不足）にも GSC（SSD I/O 増加）にも効かない。
+- **方法**: top_k を 10→4 に削減
+- **結果**: 実効 ~1.6x（warm A/B）、品質トレードオフあり
+- **状態**: opt-in つまみとして確定。デフォルト据え置き。
+- **指示**: `directive_deepseek_14_bits_topk.md` Task ②、`directive_deepseek_15_topk_verify.md`
 
-80B decode ~10 t/s は streaming-expert 設計の実質的な床と考える。
+## 2026-07-18: dispatch バッチ化（連続 slot 配列 + mx.take）
 
-## 成果サマリ（このキャンペーンの確定物）
+- **方法**: ResidentCache 内部再レイアウト。連続 slot 配列 + mx.take で mx.stack 削除。
+- **結果**: 期待速度向上 ~10%。GO 条件（≥1.3x）未達。
+- **死因**: mx.eval による weight materialize（1.24ms/call）が連続配列化でも軽減不可。
+- **状態**: NO-GO（仮結論）。
+- **指示**: `directive_deepseek_16_dispatch_batch.md`
 
-| 領域 | 状態 |
-|------|------|
-| prefill gather_qmm (35B) | ✅ **3.5×**（速度+パリティ確認済み） |
-| prefill gather_qmm (80B) | ⏳ 速度確認済み（3.5×相当）。**パリティ未検証** → §2 で取得後に完全確定 |
-| MCP / opencode tool_calls | ✅ 実動作確認済み |
-| decode | ⛔ **投機・GSC とも行き止まり。~10t/s(80B) は床。打ち止め済み** |
-| レバーB（融合永続化） | ⏸ **保留**: gather_qmm mmap で既に達成済み。cold TTFT 問題が顕在化した場合のみ再検討 |
-| 計測手法教訓 | ✅ 総括文書に誓約済み |
+## 2026-07-18: gather_qmm zero-copy decode（#17 → #18 差し戻し後）
 
-### 確定知見
+- **方法**: `ELFMOON_GATHER_DECODE=1`、lazy-build contiguous arrays from cache + gather_qmm
+- **結果**: 1.7 t/s（11.1 t/s baseline比 0.15x）。gather 通過率 11.3%（169/1488）。
+- **死因（推定）**:
+  1. **p^10 ゲート**: gather 通過率 11.3% → per-expert カバレッジ p ≈ 80%
+     （キャッシュ容量制約で説明可能。p が 95% 超なら連続配列の同期不良が疑われるが未検証）
+  2. **二重化**: cache + contiguous arrays で +1.2 GB（指示の常駐不変に違反）
+  3. 固定 overhead（routing eval 0.68ms, tolist, cache 操作）が gather_qmm の利得を相殺
+- **状態**: STOP（最終）。gather_qmm zero-copy は **この変種（lazy-rebuild コピー、二重化）で不成立**。
+  真の in-place slot 同期（cache と contiguous 配列が同一メモリを参照）は未実証のまま費用対効果で打ち切り。
+  「構造的に不可能」とは書かない。
+- **構造メモ**: top_k=10 の全ヒットゲートは p^10 で効く。
+  p=99%→通過率 90%、p=95%→60%、p=80%→11%。
+  将来 MLX 側が改善した時の再起票判断に有用。
+- **指示**: `directive_deepseek_18_gather_qmm_retry_report.md`
 
-- 投機デコード: compiled 単トークン decode が既に速く、group 検証パス 4.75× コスト、tok/pass ~1.7 では相殺不能（35B 実測）
-- GSC decode: gather_qmm + M2 が実経路 0.55× で効かない確認。同種の試行を回避可能
-- 速度主張は実 stream_generate warm A/B 必須（micro/self-contained は 3 回連続で誤導）
+---
 
-## 今後の方向性
+## decode 高速化キャンペーン総括（#14〜#18）
 
-Claude #09/#10 の推奨に従い:
+| レバー | 結果 |
+|---|---|
+| **top_k 削減** | ✅ 唯一の確定成果：opt-in ~1.6x（top_k=4）、デフォルト据え置き |
+| **expert 低ビット** | ❌ bf16→3bit でも品質不合格 |
+| **dispatch バッチ化（mx.take）** | ❌ 効果 ~10% 未満で NO-GO |
+| **gather_qmm zero-copy** | ❌ 隔離 2.5x だが実経路 0.15x で打ち切り |
 
-1. **80B prefill logits パリティ取得**（§2）→ 確定後に本番投入
-2. ~~**レバーB（層ごと融合永続化）**:~~ → **保留**: cold TTFT が実ユーザーの問題として挙がった場合のみ再検討
-3. **decode 側は静的**: 現行経路維持。新規最適化の試行は行わない
+### 再発防止チェックリスト
+- [x] 物理上限突合（#15）: top_k 倍率が物理上限内であることを確認
+- [x] 床一致確認（#15/#18）: baseline が既知床（11.1 t/s）と一致
+- [x] p^10 ゲート（#18）: gather_qmm の通過率が per-selection coverage の冪乗で決まる構造を記録
+- [x] 誤帰属クローズ禁止（#18）: 「gather_qmm カーネルが遅い」と閉じず、隔離 2.5x の事実と矛盾しない死因を記載
 
-## 計測手法の誓約
-
-今後、速度主張は以下の条件で行う:
-- **実 stream_generate 経路**（mlx_lm.generate を通す）
-- **warm A/B**（cold start ではなく warm 状態で比較）
-- micro-benchmark / 単層計測 / self-contained loop / 固定 expert は**速度判定に使わない**（3 回連続で誤導した）。
+以後の decode 施策は MLX 本体の改善など外部要因が出た時のみ再起票。

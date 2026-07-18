@@ -136,12 +136,9 @@ def main():
 
     if _model_type == "deepseek_v4":
         from model_v4 import DeepseekV4Model
-        from stream_model import _wire_deepseek_v4
 
         model = DeepseekV4Model(model_path, fused_quant=True)
-        cache, _ = _wire_deepseek_v4(
-            model, cap, top_k=6, store_dir=store_dir, model_path=model_path
-        )
+        cache = None
         from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(model_path)
@@ -212,12 +209,18 @@ def main():
         if len(messages) > 1 + MAX_HISTORY * 2:
             messages = [messages[0]] + messages[-MAX_HISTORY * 2 :]
 
-        prompt = tok.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=False,
-            enable_thinking=not no_think,
-        )
+        if _model_type == "deepseek_v4":
+            from encoding_dsv4 import encode_messages
+
+            thinking_mode = "chat" if no_think else "thinking"
+            prompt = encode_messages(messages, thinking_mode=thinking_mode)
+        else:
+            prompt = tok.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=not no_think,
+            )
 
         print("\033[1;32mElfMoon>\033[0m ", end="", flush=True)
         resp, t, answer_t = "", time.perf_counter(), 0.0
@@ -225,18 +228,26 @@ def main():
 
         try:
             if _model_type == "deepseek_v4":
-                # DeepseekV4Model は独自 generate() を使用（非ストリーミング）
                 import mlx.core as mx
 
-                model.reset_state()
                 ids = tok.encode(prompt)
-                out_ids = model.generate(mx.array(ids), max_new=MAX_TOKENS)
-                text = tok.decode(out_ids, skip_special_tokens=True)
-                # prompt 部分を除去して応答のみ抽出
-                resp = text[len(tok.decode(ids, skip_special_tokens=True)) :]
-                n = len(out_ids) - len(ids)
-                answer_t = time.perf_counter()
-                print(resp, end="", flush=True)
+                ids_arr = mx.array(ids, dtype=mx.int64)
+                new_ids = []
+                answer_t = 0.0
+                MAX_V4 = min(512, MAX_TOKENS)  # 0.3 tok/s では少量ずつ
+                for token_id in model.generate_stream(
+                    ids_arr,
+                    max_new=MAX_V4,
+                    temperature=TEMP,
+                    top_p=0.9,
+                ):
+                    new_ids.append(token_id)
+                    if answer_t == 0.0:
+                        answer_t = time.perf_counter()
+                    piece = tok.decode([token_id], skip_special_tokens=True)
+                    print(piece, end="", flush=True)
+                n = len(new_ids)
+                resp = tok.decode(new_ids, skip_special_tokens=True)
             else:
                 _sampler = make_sampler(**_sampler_kwargs)
                 _gen_kwargs = dict(

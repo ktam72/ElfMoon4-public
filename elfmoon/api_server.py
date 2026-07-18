@@ -494,9 +494,14 @@ class GenerationEngine:
                     no_think,
                     tools,
                 ) = item
-                gen = self._generate_impl(
-                    messages, max_tokens, temperature, no_think, tools
-                )
+                if self._model_type == "deepseek_v4":
+                    gen = self._generate_v4_impl(
+                        messages, max_tokens, temperature, no_think, tools
+                    )
+                else:
+                    gen = self._generate_impl(
+                        messages, max_tokens, temperature, no_think, tools
+                    )
             elif req_type == "prompt":
                 (
                     _dummy,
@@ -810,6 +815,47 @@ class GenerationEngine:
             }
             return
 
+    def _generate_v4_impl(self, messages, max_tokens, temperature, no_think, tools):
+        """DeepSeek-V4 専用生成: encode_messages + model.generate (非ストリーミング)。"""
+        from encoding_dsv4 import encode_messages
+
+        tokenizer = self._tokenizer
+        model = self._model
+
+        thinking_mode = "chat" if no_think else "thinking"
+        prompt = encode_messages(messages, thinking_mode=thinking_mode)
+        prompt_ids = tokenizer.encode(prompt)
+        prompt_tokens = len(prompt_ids)
+
+        yield prompt_tokens
+
+        ids_arr = mx.array(prompt_ids, dtype=mx.int64)
+        out_ids = model.generate(
+            ids_arr, max_new=max_tokens, temperature=temperature, top_p=0.9
+        )
+        out_list = out_ids.tolist() if hasattr(out_ids, "tolist") else list(out_ids)
+        new_ids = out_list[prompt_tokens:]
+
+        if not new_ids:
+            return
+
+        if tools:
+            output_text = tokenizer.decode(new_ids, skip_special_tokens=False)
+            clean_text, tool_calls = _extract_tool_calls(output_text)
+            yield {
+                "tool_calls": tool_calls,
+                "content": _strip_channels(clean_text or "") or None,
+            }
+        else:
+            output_text = tokenizer.decode(new_ids, skip_special_tokens=True)
+            text_out = _strip_channels(output_text)
+            if no_think:
+                stripper = ThinkStripper()
+                out = stripper.feed(text_out)
+                text_out = (out or "") + stripper.pending
+            if text_out:
+                yield (text_out, len(new_ids))
+
 
 # ---- HTTP ----
 
@@ -918,9 +964,15 @@ class APIHandler(BaseHTTPRequestHandler):
                     flush=True,
                 )
 
+        # V4: 常に messages 経路（encode_messages で prompt 構築）
+        if eng._model_type == "deepseek_v4":
+            if stream:
+                self._handle_stream_tools(messages, max_tokens, temperature, tools)
+            else:
+                self._handle_nonstream_tools(messages, max_tokens, temperature, tools)
         # ツールなし → 従来通り API ハンドラ側で prompt レンダリング（高速パス）
         # ツールあり → エンジンに messages + tools を渡してループ処理
-        if not tools:
+        elif not tools:
             try:
                 prompt = self._tokenizer.apply_chat_template(
                     messages,
