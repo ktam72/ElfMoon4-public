@@ -707,6 +707,48 @@ def wire_streaming(
     if n_dense:
         print(f"  dense層{n_dense}個はストリーミング対象外のまま常駐（通常のMLP）")
     mx.clear_cache()
+
+    # 起動時ウォームスタート: 前回セッション終了時の常駐セットを SSD から先読みし、
+    # コールドスタート直後の命中率を前回定常値から開始する。
+    # ELFMOON_PRIME: 0=無効 / 1=キャッシュ容量まで（既定） / N>1=上限N個
+    _hotset_path = os.path.join(store_dir or STORE_DIR, "hotset.json")
+    _prime = os.environ.get("ELFMOON_PRIME", "1")
+    if _prime != "0" and os.path.exists(_hotset_path):
+        try:
+            import time as _time
+
+            _t0 = _time.time()
+            _keys = json.load(open(_hotset_path))
+            _cap = cache.capacity if _prime == "1" else min(int(_prime), cache.capacity)
+            _keys = _keys[-_cap:]  # 保存順は LRU→MRU。直近使用分を優先
+            _pending = []
+            for _le in _keys:
+                _w = store.load(int(_le[0]), int(_le[1]))
+                cache.prime((int(_le[0]), int(_le[1])), _w)
+                _pending.extend(_w.values())
+                # 遅延ロードを溜めすぎると fd 枯渇するため、こまめに実体化して閉じる
+                if len(_pending) >= 384:
+                    mx.eval(_pending)
+                    _pending = []
+            if _pending:
+                mx.eval(_pending)
+            print(
+                f"  ウォームスタート: {len(_keys)} experts プライム（{_time.time() - _t0:.0f}秒）"
+            )
+        except Exception as _e:
+            print(f"  ウォームスタート失敗（無視して続行）: {_e}")
+
+    import atexit
+
+    def _save_hotset(_cache=cache, _path=_hotset_path):
+        try:
+            _ks = [[int(k[0]), int(k[1])] for k in _cache._d.keys()]
+            with open(_path, "w") as _f:
+                json.dump(_ks, _f)
+        except Exception:
+            pass
+
+    atexit.register(_save_hotset)
     return cache, store
 
 
