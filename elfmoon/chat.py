@@ -32,6 +32,7 @@ logging.disable(logging.WARNING)
 from mlx_lm import load, stream_generate
 from mlx_lm.utils import load_model
 from mlx_lm.sample_utils import make_sampler
+from mlx_lm.models.cache import make_prompt_cache
 from stream_model import MODELS_ROOT, list_models, resolve_model, wire_streaming
 from pathlib import Path
 
@@ -42,6 +43,8 @@ TEMP = 0.4
 # プレフィルのチャンク幅。stream_generate 既定(512)は融合gather経路の閾値未満で
 # 高速化されないため大きくする。api_server.py と同じ環境変数で連動。
 PREFILL_STEP = int(os.environ.get("ELFMOON_PREFILL_STEP", "4096"))
+# KV キャッシュ永続化（api_server と同じ kv_manager を利用）。ELFMOON_KVC=0 で無効。
+KVC = os.environ.get("ELFMOON_KVC", "1") != "0"
 
 
 def _strip_think(text_iter, no_think):
@@ -254,6 +257,53 @@ def main():
                     sampler=_sampler,
                     prefill_step_size=PREFILL_STEP,
                 )
+                _kvc_save_ids, _kvc_snap = None, None
+                if KVC:
+                    # 会話履歴部分の KV を再利用し、毎ターンの全履歴再プレフィルを回避する。
+                    # 失敗時は従来経路にフォールバック（会話は止めない）。
+                    try:
+                        from kv_manager import kv_manager
+                        import mlx.core as mx
+
+                        prompt_ids = tok.encode(prompt)
+                        nogen = tok.apply_chat_template(
+                            messages,
+                            add_generation_prompt=False,
+                            tokenize=False,
+                            enable_thinking=not no_think,
+                        )
+                        nogen_ids = tok.encode(nogen)
+                        boundary = 0
+                        for bi in range(min(len(nogen_ids), len(prompt_ids))):
+                            if prompt_ids[bi] != nogen_ids[bi]:
+                                break
+                            boundary = bi + 1
+                        cached_cache, cached_len = kv_manager.lookup(prompt_ids, model)
+                        if cached_cache is not None and cached_len < len(prompt_ids):
+                            prompt_cache = cached_cache
+                        else:
+                            prompt_cache = make_prompt_cache(model)
+                            cached_len = 0
+                        if cached_len < boundary:
+                            remaining = prompt_ids[cached_len:boundary]
+                            for ci in range(0, len(remaining), PREFILL_STEP):
+                                model(
+                                    mx.array([remaining[ci : ci + PREFILL_STEP]]),
+                                    cache=prompt_cache,
+                                )
+                            _kvc_snap = kv_manager.snapshot(prompt_cache)
+                            _kvc_save_ids = prompt_ids[:boundary]
+                        if cached_len:
+                            print(
+                                f"\033[2m（KVC: {cached_len}tok 再利用）\033[0m ",
+                                end="",
+                                flush=True,
+                            )
+                        _gen_kwargs.update(
+                            prompt=prompt_ids[boundary:], prompt_cache=prompt_cache
+                        )
+                    except Exception:
+                        pass  # 従来経路（全プレフィル）で続行
                 generator = stream_generate(**_gen_kwargs)
 
                 def _texts():
@@ -266,6 +316,13 @@ def main():
                     print(piece, end="", flush=True)
                     resp += piece
                     n += 1
+                if _kvc_save_ids is not None:
+                    try:
+                        from kv_manager import kv_manager
+
+                        kv_manager.save(_kvc_save_ids, _kvc_snap)
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"\n\033[1;31m[エラー] 生成が中断されました: {e}\033[0m")
 
