@@ -112,6 +112,10 @@ HF_HUB_DISABLE_XET=1 hf download mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit 
 python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT/qwen3-next-80b-mlx
 python3 elfmoon/chat.py --model qwen3-next-80b-mlx
 
+# 高速モード（opt-in）: routing top_k を 6 に削減し decode ~1.4-1.6x。
+# わずかな品質トレードオフあり（既定は無効）。ELFMOON_TOP_K=N でも指定可。
+python3 elfmoon/chat.py --model qwen3-next-80b-mlx --fast
+
 # Ornith-1.0-35B（エージェンティックコーディング）
 HF_HUB_DISABLE_XET=1 hf download mlx-community/Ornith-1.0-35B-4bit \
   --local-dir $ELFMOON_MODELS_ROOT/ornith-1.0-35b-mlx
