@@ -781,6 +781,19 @@ def wire_streaming(
         )
     if top_k is None:
         top_k = _read_top_k(model_path)
+    # ELFMOON_TOP_K: 推論時 top_k 削減（opt-in 高速化・実測 80B top_k=4 で ~1.6x）。
+    # 学習時 top_k を超える指定や 0 以下は無効。品質トレードオフがあるため既定は不変。
+    _tk_env = os.environ.get("ELFMOON_TOP_K")
+    if _tk_env:
+        try:
+            _tk = int(_tk_env)
+            if 1 <= _tk < top_k:
+                print(f"  top_k override: {top_k} → {_tk}（ELFMOON_TOP_K, 品質注意）")
+                top_k = _tk
+            elif _tk != top_k:
+                print(f"  ELFMOON_TOP_K={_tk} は無効（有効範囲 1〜{top_k - 1}）: 無視")
+        except ValueError:
+            print(f"  ELFMOON_TOP_K={_tk_env!r} は数値でない: 無視")
     activation, routing_scale = _read_routing_config(model_path)
     if activation not in ("softmax", "sigmoid", "sqrtsoftplus"):
         raise ValueError(

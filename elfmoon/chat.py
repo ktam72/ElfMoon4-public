@@ -9,7 +9,10 @@
     python3 chat.py --model 80b           # ELFMOON_MODELS_ROOT/80b を使用
     python3 chat.py --model 80b 1200      # モデル指定 + 省メモリ
     python3 chat.py --no-think            # 思考プロセスを非表示
+    python3 chat.py --fast                # 高速モード（top_k=6、実測~1.4-1.6x、品質トレードオフ）
     python3 chat.py --list                # 利用可能なモデル一覧
+
+環境変数 ELFMOON_TOP_K=N でも指定可（--fast より優先、ストリーミング MoE のみ有効）。
 """
 
 import logging
@@ -98,12 +101,16 @@ def main():
 
     no_think = "--no-think" in argv
     perf = "--perf" in argv
+    fast = "--fast" in argv
+    if fast and not os.environ.get("ELFMOON_TOP_K"):
+        # \u5b9f\u6e2c ~1.4-1.6x\uff08\u54c1\u8cea\u30c8\u30ec\u30fc\u30c9\u30aa\u30d5\u3042\u308a\u30fbopt-in\uff09\u3002\u660e\u793a env \u304c\u3042\u308c\u3070\u305d\u3061\u3089\u3092\u512a\u5148\u3002
+        os.environ["ELFMOON_TOP_K"] = "6"
     model_name = None
     if "--model" in argv:
         idx = argv.index("--model")
         model_name = argv[idx + 1].strip().replace("\u3000", "")
         argv = argv[:idx] + argv[idx + 2 :]
-    cap_strs = [a for a in argv if a not in ("--no-think", "--perf")]
+    cap_strs = [a for a in argv if a not in ("--no-think", "--perf", "--fast")]
     cap = int(cap_strs[0]) if cap_strs else 6144
 
     model_path, store_dir = resolve_model(model_name)
