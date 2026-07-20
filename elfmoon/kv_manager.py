@@ -74,13 +74,24 @@ class KVCacheManager:
         self._max_entries = max_entries
         self._dir = cache_dir
         self._disk_lock = threading.Lock()
+        self._namespace = b""
         os.makedirs(self._dir, exist_ok=True)
         self._purge_old_format()
+
+    def set_namespace(self, name: str):
+        """キャッシュキーの名前空間（モデル識別子）を設定する。
+
+        キーはトークン列のみから作られるため、異なるモデル間で同一プロンプトが
+        衝突し KV 形状不一致でクラッシュする。モデルパス等を渡して分離すること。
+        """
+        self._namespace = name.encode()
 
     # ---- hash ----
 
     def _hash_prefix(self, tokens: list[int], length: int) -> str:
-        packed = b"".join(struct.pack("<i", t) for t in tokens[:length])
+        packed = self._namespace + b"\x00" + b"".join(
+            struct.pack("<i", t) for t in tokens[:length]
+        )
         return hashlib.sha256(packed).hexdigest()
 
     # ---- snapshot ----

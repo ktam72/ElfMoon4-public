@@ -135,6 +135,14 @@ def main():
     cap = int(cap_strs[0]) if cap_strs else 6144
 
     model_path, store_dir = resolve_model(model_name)
+    if KVC:
+        # KV キャッシュをモデル別に分離（モデル間の同一プロンプト衝突＝形状不一致を防ぐ）
+        try:
+            from kv_manager import kv_manager
+
+            kv_manager.set_namespace(os.path.basename(model_path))
+        except Exception:
+            pass
     import json
 
     with open(os.path.join(model_path, "config.json")) as f:
@@ -154,6 +162,10 @@ def main():
         # GLM 推奨: temp=1.0, top_p=0.95, min_p=0.01（repeat_penalty=1.0は未対応）
         TEMP = 1.0
         _sampler_kwargs = dict(temp=TEMP, top_p=0.95, min_p=0.01)
+    elif "agents-a1" in _model_name:
+        # Agents-A1 推奨: temp=0.85, top_p=0.95, top_k=20（presence_penalty は未対応）
+        TEMP = 0.85
+        _sampler_kwargs = dict(temp=TEMP, top_p=0.95, top_k=20)
     else:
         TEMP = 0.4
 
