@@ -35,6 +35,7 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 
 | モデル | タイプ | ファイルサイズ | デコード t/s | 備考 |
 |---|---|---|---|---|
+| **[Agents-A1-4B](https://huggingface.co/InternScience/Agents-A1-4B)** | オンメモリ | 2.2 GB | **80** | 最速・軽量エージェント特化。MLX版未公開のため `mlx_lm convert -q` で 4bit 化が必要 |
 | **[Gemma4-26B-A4B-it-4bit](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-4bit)**（最推奨） | オンメモリ | 15 GB | **72** | `mx.compile` で 5×高速化。品質・速度の最適バランス |
 | **[Gemma4-Heretic](https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-heretic-4bit)** | オンメモリ | 15.6 GB | **65** | Heretic 変種 |
 | **[GLM-4.7-Flash](https://huggingface.co/mlx-community/GLM-4.7-Flash-4bit)** | オンメモリ | 16.9 GB | **61** | Zhipu 製、日本語可、高速 |
@@ -43,6 +44,7 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 | **[Ornith-1.0-35B](https://huggingface.co/mlx-community/Ornith-1.0-35B-4bit)** | ストリーミング MoE | 37 GB | **35** | エージェンティックコーディング特化 |
 | **[Qwen3.6-35B-Heretic](https://huggingface.co/froggeric/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit)**（実験的） | ストリーミング MoE | 19 GB | **35** | Heretic 変種 |
 | **[Huihui-Qwen3.5-Claude-4.6-Opus-abliterated](https://huggingface.co/mlx-community/Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-4bit)** | ストリーミング MoE | 14 GB | **28** | Opus推論蒸馏・アブリテイテッド、要tokenizer修正 |
+| **[Agents-A1](https://huggingface.co/mlx-community/Agents-A1-4bit)** | ストリーミング MoE | 19 GB | **25** | エージェント特化 35B MoE（BrowseComp/GAIA 高スコア）。推奨 temp=0.85 は自動適用 |
 | **[Bonsai-27B-2bit](https://huggingface.co/mlx-community/Ternary-Bonsai-27B-2bit)** | オンメモリ | 8.5 GB | **24** | 2bit ternary、軽量 |
 | **[Qwen3-Next-80B](https://huggingface.co/mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit)**（実験的） | ストリーミング MoE | 42 GB | **25** | 品質重視 80B |
 | **[Qwen3-Coder-Next](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit)** | ストリーミング MoE | 42 GB | **22** | コード特化 |
