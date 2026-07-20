@@ -33,6 +33,9 @@ DISK_CACHE_DIR = os.environ.get("ELFMOON_KV_CACHE_DIR") or os.path.expanduser(
 MAX_DISK_ENTRIES = 4
 MIN_SAVE_TOKENS = 20
 FORMAT_VERSION = 2
+# 情報ログ（hit/save 等）。対話 CLI ではプロンプト表示に割り込むため抑制できる。
+# エラーログは本フラグに関わらず常に出す。
+KVC_LOG = os.environ.get("ELFMOON_KVC_LOG", "1") != "0"
 
 
 def _build_cache_objects(
@@ -148,11 +151,12 @@ class KVCacheManager:
             self._caches.move_to_end(key)
             while len(self._caches) > self._max_entries:
                 self._caches.popitem(last=False)
-            print(
-                f"[KVC] disk→memory: key={key[:12]} offset={offset}",
-                file=sys.stderr,
-                flush=True,
-            )
+            if KVC_LOG:
+                print(
+                    f"[KVC] disk→memory: key={key[:12]} offset={offset}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             return _build_cache_objects(offset, layer_data, n_layers), offset
 
         return None, 0
@@ -253,12 +257,13 @@ class KVCacheManager:
 
                 self._cleanup_disk()
 
-            print(
-                f"[KVC] disk save: key={key[:12]} offset={offset} "
-                f"kv={len(kv_indices)} arr={len(arr_indices)}/{len(layer_data)}",
-                file=sys.stderr,
-                flush=True,
-            )
+            if KVC_LOG:
+                print(
+                    f"[KVC] disk save: key={key[:12]} offset={offset} "
+                    f"kv={len(kv_indices)} arr={len(arr_indices)}/{len(layer_data)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         except Exception as e:
             print(f"[KVC] disk save error: {e}", file=sys.stderr, flush=True)
 
@@ -320,11 +325,12 @@ class KVCacheManager:
             if version != FORMAT_VERSION:
                 key = fname[: -len(".json")]
                 self._disk_delete(key)
-                print(
-                    f"[KVC] purged old-format entry: {key[:12]}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                if KVC_LOG:
+                    print(
+                        f"[KVC] purged old-format entry: {key[:12]}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
     def _cleanup_disk(self):
         entries = self._list_disk_entries()

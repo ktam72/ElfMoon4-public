@@ -45,17 +45,35 @@ TEMP = 0.4
 PREFILL_STEP = int(os.environ.get("ELFMOON_PREFILL_STEP", "4096"))
 # KV キャッシュ永続化（api_server と同じ kv_manager を利用）。ELFMOON_KVC=0 で無効。
 KVC = os.environ.get("ELFMOON_KVC", "1") != "0"
+# 対話 CLI では KVC の情報ログがプロンプト表示に割り込むため既定で抑制（エラーは出る）
+os.environ.setdefault("ELFMOON_KVC_LOG", "0")
 
 
-def _strip_think(text_iter, no_think):
+def _strip_think(text_iter, no_think, in_think=False):
     """Strip <think>/</think> blocks from stream if no_think is set.
 
-    以下2形式に対応:
+    以下3形式に対応:
     1. <think>...</think> 形式（Qwen標準、templateが開きタグを出力）
     2. 開きタグ無しで推論内容→</think> 形式（一部fine-tuneモデル）
+    3. in_think=True: Thinking専用モデル（templateがプロンプト側に <think> を
+       置くため出力にタグが無い）。最初から think 内として </think> まで捨てる。
     """
     if not no_think:
         yield from text_iter
+        return
+
+    if in_think:
+        buf = ""
+        for piece in text_iter:
+            buf += piece
+            if "</think>" in buf:
+                after = buf.split("</think>", 1)[1]
+                if after.strip():
+                    yield after.lstrip("\n")
+                yield from text_iter
+                return
+            # </think> がタグ途中で分割されて届く場合に備え末尾だけ保持
+            buf = buf[-16:]
         return
 
     buf = ""
@@ -232,6 +250,7 @@ def main():
         print("\033[1;32mElfMoon>\033[0m ", end="", flush=True)
         resp, t, answer_t = "", time.perf_counter(), 0.0
         n = 0
+        think_s = 0.0
 
         try:
             if _model_type == "deepseek_v4":
@@ -306,16 +325,44 @@ def main():
                         pass  # 従来経路（全プレフィル）で続行
                 generator = stream_generate(**_gen_kwargs)
 
+                # Thinking専用モデル: template がプロンプト側に <think> を置き
+                # 出力に開きタグが現れないため、最初から think 内として扱う
+                _gp = _gen_kwargs["prompt"]
+                if isinstance(_gp, str):
+                    _in_think = no_think and _gp.rstrip().endswith("<think>")
+                else:
+                    _tail = tok.decode(list(_gp[-8:])) if len(_gp) else ""
+                    _in_think = no_think and _tail.rstrip().endswith("<think>")
+
+                _first_raw_t = [0.0]
+
                 def _texts():
                     for out in generator:
+                        if _first_raw_t[0] == 0.0:
+                            _first_raw_t[0] = time.perf_counter()
                         yield out.text
 
-                for piece in _strip_think(_texts(), no_think):
+                if _in_think:
+                    print("\033[2m（思考中…）\033[0m", end="", flush=True)
+                for piece in _strip_think(_texts(), no_think, in_think=_in_think):
                     if answer_t == 0.0:
                         answer_t = time.perf_counter()
+                        if _in_think:
+                            # 思考中表示を消して回答を書き始める
+                            print("\r\033[K\033[1;32mElfMoon>\033[0m ", end="", flush=True)
+                        piece = piece.lstrip("\n")  # 回答冒頭の空行を除去
+                        if not piece:
+                            answer_t = 0.0  # 空白のみなら次piece を冒頭扱い
+                            continue
                     print(piece, end="", flush=True)
                     resp += piece
                     n += 1
+                # 隠した思考の時間（応答 t/s の分母には乗せない）
+                think_s = (
+                    (answer_t - _first_raw_t[0])
+                    if (_in_think and answer_t and _first_raw_t[0])
+                    else 0.0
+                )
                 if _kvc_save_ids is not None:
                     try:
                         from kv_manager import kv_manager
@@ -330,7 +377,10 @@ def main():
             (time.perf_counter() - answer_t) if answer_t else (time.perf_counter() - t)
         )
         hit = f", 命中率{cache.hit_rate * 100:.0f}%" if cache else ""
-        print(f"\n\033[2m（{n} tokens, {n / elapsed:.1f} tok/s{hit}）\033[0m")
+        think_info = f"思考 {think_s:.1f}s ／ " if think_s > 0 else ""
+        print(
+            f"\n\033[2m（{think_info}{n} tokens, {n / elapsed:.1f} tok/s{hit}）\033[0m"
+        )
         messages.append({"role": "assistant", "content": resp})
 
 
