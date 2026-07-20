@@ -1376,6 +1376,8 @@ def main():
     cap = int(args[1]) if len(args) > 1 else DEFAULT_CAPACITY
 
     model_path, store_dir = resolve_model(model_name)
+    # KV キャッシュをモデル別に分離（モデル間の同一プロンプト衝突＝形状不一致を防ぐ）
+    kv_manager.set_namespace(os.path.basename(model_path))
 
     global MODEL_ID, engine
     MODEL_ID = model_name or os.path.basename(model_path)
