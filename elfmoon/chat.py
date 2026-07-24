@@ -16,9 +16,13 @@
 """
 
 import logging
+import fcntl
 import os
+import select
 import sys
+import termios
 import time
+import tty
 
 # プロジェクトルートをパスに追加（model_v4.py の elfmoon. インポート用）
 _PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,6 +51,197 @@ PREFILL_STEP = int(os.environ.get("ELFMOON_PREFILL_STEP", "4096"))
 KVC = os.environ.get("ELFMOON_KVC", "1") != "0"
 # 対話 CLI では KVC の情報ログがプロンプト表示に割り込むため既定で抑制（エラーは出る）
 os.environ.setdefault("ELFMOON_KVC_LOG", "0")
+
+
+def _read_utf8_char(fd):
+    b0 = os.read(fd, 1)
+    if not b0:
+        return None
+    c0 = b0[0]
+    if c0 < 0x80:
+        return chr(c0)
+    if c0 < 0xC0:
+        return "\ufffd"
+    need = 2 if c0 < 0xE0 else 3 if c0 < 0xF0 else 4
+    raw = b0
+    for _ in range(need - 1):
+        more = os.read(fd, 1)
+        if not more:
+            break
+        raw += more
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "\ufffd"
+
+
+def _read_esc_seq(fd):
+    r, _, _ = select.select([fd], [], [], 0.05)
+    if not r:
+        return None
+    first = os.read(fd, 1)
+    if not first:
+        return None
+    if first == b"[":  # CSI: read until final byte (0x40-0x7E)
+        seq = first
+        for _ in range(15):
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if not r:
+                break
+            cb = os.read(fd, 1)
+            if not cb:
+                break
+            seq += cb
+            if cb[0] in range(0x40, 0x7F):
+                break
+        return seq
+    if first == b"O":  # SS3: read one more byte
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            cb = os.read(fd, 1)
+            if cb:
+                return first + cb
+        return first
+    if first[0] in range(0x40, 0x7F):  # Two-char sequence
+        return first
+    return first
+
+
+def _read_until_paste_end(fd):
+    chars = []
+    while True:
+        ch = _read_utf8_char(fd)
+        if ch is None:
+            raise EOFError
+        if ch == "\x1b":
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                seq = _read_esc_seq(fd)
+                if seq == b"[201~":
+                    return "".join(chars)
+            chars.append(ch)
+            continue
+        if ch == "\x7f":
+            if chars:
+                chars.pop()
+            continue
+        chars.append(ch)
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+
+
+def _read_line_raw(fd):
+    """Read one line in raw mode. Returns the line (without newline)."""
+    chars = []
+    while True:
+        ch = _read_utf8_char(fd)
+        if ch is None:
+            raise EOFError
+        if ch in "\n\r":
+            print()
+            return "".join(chars)
+        if ch == "\x7f":
+            if chars:
+                chars.pop()
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+            continue
+        if ch == "\x1b":
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                seq = _read_esc_seq(fd)
+                if seq == b"[200~":
+                    paste_content = _read_until_paste_end(fd)
+                    return paste_content
+            elif chars:
+                sys.stdout.write("\b \b" * len(chars))
+                sys.stdout.flush()
+                chars = []
+            continue
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch == "\x04":
+            raise EOFError
+        if ch == "\t" or ch.isprintable() or ch.isspace():
+            chars.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+
+
+def read_user_input(prompt):
+    """Read user input in raw mode. Detects paste instantly, ESC to clear."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    print(prompt, end="", flush=True)
+    try:
+        tty.setcbreak(fd)
+        a = termios.tcgetattr(fd)
+        a[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+        termios.tcsetattr(fd, termios.TCSANOW, a)
+
+        first = _read_line_raw(fd)
+
+        extra_data = b""
+        r, _, _ = select.select([fd], [], [], 0.1)
+        while r:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            extra_data += chunk
+            r, _, _ = select.select([fd], [], [], 0.2)
+
+        if extra_data:
+            r, _, _ = select.select([fd], [], [], 0.4)
+            while r:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                extra_data += chunk
+                r, _, _ = select.select([fd], [], [], 0.2)
+
+        if extra_data:
+            extra = extra_data.decode("utf-8", errors="replace").split("\n")
+            if extra[-1] == "":
+                extra = extra[:-1]
+            lines = [first] + extra if first else extra
+            for l in extra:
+                print(f"  {l}")
+            print("\033[2m（空行で確定）\033[0m")
+            while True:
+                r, _, _ = select.select([fd], [], [], 0)
+                while r:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    extra_data += chunk
+                    r, _, _ = select.select([fd], [], [], 0)
+                if extra_data:
+                    more_parts = (
+                        extra_data.decode("utf-8", errors="replace")
+                        .rstrip("\n")
+                        .split("\n")
+                    )
+                    extra_data = b""
+                    for mp in more_parts:
+                        lines.append(mp)
+                        print(f"  {mp}")
+                more = _read_line_raw(fd)
+                if not more:
+                    break
+                lines.append(more)
+            return "\n".join(lines).strip()
+
+        if not first:
+            return None
+        return first.strip()
+
+    except (KeyboardInterrupt, EOFError):
+        raise
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except:
+            pass
 
 
 def _strip_think(text_iter, no_think, in_think=False):
@@ -235,10 +430,12 @@ def main():
     messages = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            user = input("\n\033[1;36mあなた>\033[0m ").strip()
+            user = read_user_input("\n\033[1;36mあなた>\033[0m ")
         except (EOFError, KeyboardInterrupt):
             print("\n終了します。")
             break
+        if user is None:
+            continue
         if user.lower() in ("exit", "quit"):
             print("終了します。")
             break
@@ -300,6 +497,9 @@ def main():
                     prefill_step_size=PREFILL_STEP,
                 )
                 _kvc_save_ids, _kvc_snap = None, None
+                _prefill_n = 0
+                _prefill_t0 = None
+                _prefill_t1_ref = [None]
                 if KVC:
                     # 会話履歴部分の KV を再利用し、毎ターンの全履歴再プレフィルを回避する。
                     # 失敗時は従来経路にフォールバック（会話は止めない）。
@@ -326,6 +526,8 @@ def main():
                         else:
                             prompt_cache = make_prompt_cache(model)
                             cached_len = 0
+                        _prefill_n = len(prompt_ids) - cached_len
+                        _prefill_t0 = time.perf_counter()
                         if cached_len < boundary:
                             remaining = prompt_ids[cached_len:boundary]
                             for ci in range(0, len(remaining), PREFILL_STEP):
@@ -346,6 +548,12 @@ def main():
                         )
                     except Exception:
                         pass  # 従来経路（全プレフィル）で続行
+                if _prefill_n == 0:
+                    prompt_ids = (
+                        tok.encode(prompt) if isinstance(prompt, str) else prompt
+                    )
+                    _prefill_n = len(prompt_ids) if isinstance(prompt_ids, list) else 0
+                    _prefill_t0 = time.perf_counter()
                 generator = stream_generate(**_gen_kwargs)
 
                 # Thinking専用モデル: template がプロンプト側に <think> を置き
@@ -363,6 +571,8 @@ def main():
                     for out in generator:
                         if _first_raw_t[0] == 0.0:
                             _first_raw_t[0] = time.perf_counter()
+                            if _prefill_t1_ref[0] is None:
+                                _prefill_t1_ref[0] = _first_raw_t[0]
                         yield out.text
 
                 if _in_think:
@@ -372,7 +582,9 @@ def main():
                         answer_t = time.perf_counter()
                         if _in_think:
                             # 思考中表示を消して回答を書き始める
-                            print("\r\033[K\033[1;32mElfMoon>\033[0m ", end="", flush=True)
+                            print(
+                                "\r\033[K\033[1;32mElfMoon>\033[0m ", end="", flush=True
+                            )
                         piece = piece.lstrip("\n")  # 回答冒頭の空行を除去
                         if not piece:
                             answer_t = 0.0  # 空白のみなら次piece を冒頭扱い
@@ -399,10 +611,23 @@ def main():
         elapsed = (
             (time.perf_counter() - answer_t) if answer_t else (time.perf_counter() - t)
         )
+        _pf_elapsed = (
+            _prefill_t1_ref[0] - _prefill_t0
+            if (
+                _prefill_t0 is not None
+                and _prefill_t1_ref[0] is not None
+                and _prefill_t1_ref[0] > _prefill_t0
+            )
+            else None
+        )
+        pf_info = ""
+        if _pf_elapsed is not None and _pf_elapsed > 0:
+            pf_speed = _prefill_n / _pf_elapsed
+            pf_info = f"プリフィル {_prefill_n}tok {pf_speed:.0f}tok/s ／ "
         hit = f", 命中率{cache.hit_rate * 100:.0f}%" if cache else ""
         think_info = f"思考 {think_s:.1f}s ／ " if think_s > 0 else ""
         print(
-            f"\n\033[2m（{think_info}{n} tokens, {n / elapsed:.1f} tok/s{hit}）\033[0m"
+            f"\n\033[2m（{think_info}{pf_info}出力 {n} tokens, {n / elapsed:.1f} tok/s{hit}）\033[0m"
         )
         messages.append({"role": "assistant", "content": resp})
 
